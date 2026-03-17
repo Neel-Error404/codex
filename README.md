@@ -56,6 +56,8 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 - [**Contributing**](./docs/contributing.md)
 - [**Installing & building**](./docs/install.md)
 - [**GPT-5.4 Agent Upgrades Status**](./docs/plans/2026-03-17-gpt54-agent-upgrades.md)
+- [**Fork maintenance protocol**](./docs/plans/2026-03-17-codex-fork-maintenance.md)
+- [**Founder log: custom stack**](./docs/plans/2026-03-17-founder-log-codex-stack.md)
 - [**Open source fund**](./docs/open-source-fund.md)
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).

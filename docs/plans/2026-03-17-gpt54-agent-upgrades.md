@@ -184,3 +184,8 @@ Measure at minimum:
 - total time to task completion
 - number of full-file reads vs targeted inspections
 - recovery quality after kernel reset or long-session drift
+
+## See Also
+
+- [`2026-03-17-codex-fork-maintenance.md`](./2026-03-17-codex-fork-maintenance.md)
+- [`2026-03-17-founder-log-codex-stack.md`](./2026-03-17-founder-log-codex-stack.md)

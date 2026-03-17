@@ -98,3 +98,11 @@ log *args:
 # Run the branch-local validation harness for tool_search + sparse_context upgrades.
 agent-upgrades-check *args:
     python ../scripts/agent_upgrade_check.py "$@"
+
+# Scan for likely credential leaks in staged changes or outgoing branch diffs.
+git-guardrails-check *args:
+    python ../scripts/git_guardrails.py "$@"
+
+# Install local pre-commit and pre-push hooks for credential leak scanning.
+install-git-guardrails:
+    python ../scripts/install_git_guardrails.py
