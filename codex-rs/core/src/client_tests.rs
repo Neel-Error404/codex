@@ -2,8 +2,13 @@ use super::AuthRequestTelemetryContext;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::UnauthorizedRecoveryExecution;
+use super::build_chat_messages;
+use super::map_chat_role;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -115,4 +120,58 @@ fn auth_request_telemetry_context_tracks_attached_auth_and_retry_phase() {
     assert!(auth_context.retry_after_unauthorized);
     assert_eq!(auth_context.recovery_mode, Some("managed"));
     assert_eq!(auth_context.recovery_phase, Some("refresh_token"));
+}
+
+#[test]
+fn map_chat_role_handles_known_and_unknown_roles() {
+    assert_eq!(map_chat_role("developer"), "system");
+    assert_eq!(map_chat_role("assistant"), "assistant");
+    assert_eq!(map_chat_role("unknown-role"), "user");
+}
+
+#[test]
+fn build_chat_messages_serializes_tool_roundtrip_items() {
+    let input = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "hello".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        },
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "exec_command".to_string(),
+            namespace: None,
+            arguments: r#"{"cmd":"pwd"}"#.to_string(),
+            call_id: "call_1".to_string(),
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: "call_1".to_string(),
+            output: FunctionCallOutputPayload::from_text("ok".to_string()),
+        },
+    ];
+
+    let messages = build_chat_messages("be helpful", input);
+    assert_eq!(
+        messages,
+        vec![
+            json!({"role":"system","content":"be helpful"}),
+            json!({"role":"user","content":"hello"}),
+            json!({
+                "role":"assistant",
+                "content":"",
+                "tool_calls":[
+                    {
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{"name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}
+                    }
+                ]
+            }),
+            json!({"role":"tool","tool_call_id":"call_1","content":"ok"}),
+        ]
+    );
 }

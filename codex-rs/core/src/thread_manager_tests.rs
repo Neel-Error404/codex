@@ -157,7 +157,7 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
 }
 
 #[tokio::test]
-async fn new_uses_configured_openai_provider_for_model_refresh() {
+async fn new_uses_active_provider_for_model_refresh() {
     let server = MockServer::start().await;
     let models_mock = mount_models_once(&server, ModelsResponse { models: vec![] }).await;
 
@@ -167,11 +167,7 @@ async fn new_uses_configured_openai_provider_for_model_refresh() {
     config.cwd = config.codex_home.clone();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
     config.model_catalog = None;
-    config
-        .model_providers
-        .get_mut("openai")
-        .expect("openai provider should exist")
-        .base_url = Some(server.uri());
+    config.model_provider.base_url = Some(server.uri());
 
     let auth_manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
@@ -184,4 +180,35 @@ async fn new_uses_configured_openai_provider_for_model_refresh() {
 
     let _ = manager.list_models(RefreshStrategy::Online).await;
     assert_eq!(models_mock.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn new_uses_active_provider_for_available_models() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config();
+    config.codex_home = temp_dir.path().join("codex-home");
+    config.cwd = config.codex_home.clone();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let mut provider = crate::model_provider_info::create_oss_provider_with_base_url(
+        "https://example.com/v1",
+        crate::model_provider_info::WireApi::Responses,
+    );
+    provider.name = "Azure Foundry".to_string();
+    provider.models = Some(vec!["kimi-k2".to_string()]);
+    config.model_provider = provider;
+
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager,
+        SessionSource::Exec,
+        CollaborationModesConfig::default(),
+    );
+
+    let available = manager.list_models(RefreshStrategy::Offline).await;
+    assert!(
+        available.iter().any(|model| model.model == "kimi-k2"),
+        "active provider models should be visible in the picker"
+    );
 }

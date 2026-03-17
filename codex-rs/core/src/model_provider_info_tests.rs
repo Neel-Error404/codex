@@ -22,6 +22,7 @@ base_url = "http://localhost:11434/v1"
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        models: None,
     };
 
     let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -53,6 +54,7 @@ query_params = { api-version = "2025-04-01-preview" }
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        models: None,
     };
 
     let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -87,6 +89,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        models: None,
     };
 
     let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -94,7 +97,37 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
 }
 
 #[test]
-fn test_deserialize_chat_wire_api_shows_helpful_error() {
+fn test_deserialize_model_provider_toml_with_models() {
+    let provider_toml = r#"
+name = "Azure Foundry"
+base_url = "https://example.services.ai.azure.com/models"
+env_key = "AZURE_INFERENCE_CREDENTIAL"
+models = ["kimi-k2", "deepseek-v3.2"]
+        "#;
+    let expected_provider = ModelProviderInfo {
+        name: "Azure Foundry".into(),
+        base_url: Some("https://example.services.ai.azure.com/models".into()),
+        env_key: Some("AZURE_INFERENCE_CREDENTIAL".into()),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+        models: Some(vec!["kimi-k2".into(), "deepseek-v3.2".into()]),
+    };
+
+    let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
+    assert_eq!(expected_provider, provider);
+}
+
+#[test]
+fn test_deserialize_chat_wire_api() {
     let provider_toml = r#"
 name = "OpenAI using Chat Completions"
 base_url = "https://api.openai.com/v1"
@@ -102,6 +135,6 @@ env_key = "OPENAI_API_KEY"
 wire_api = "chat"
         "#;
 
-    let err = toml::from_str::<ModelProviderInfo>(provider_toml).unwrap_err();
-    assert!(err.to_string().contains(CHAT_WIRE_API_REMOVED_ERROR));
+    let provider = toml::from_str::<ModelProviderInfo>(provider_toml).unwrap();
+    assert_eq!(provider.wire_api, WireApi::Chat);
 }

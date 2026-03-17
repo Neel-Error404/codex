@@ -2250,6 +2250,74 @@ pub fn create_tools_json_for_responses_api(
     Ok(tools_json)
 }
 
+/// Returns JSON values that are compatible with function calling in Chat
+/// Completions APIs.
+pub fn create_tools_json_for_chat_completions(
+    tools: &[ToolSpec],
+) -> crate::error::Result<Vec<serde_json::Value>> {
+    let mut tools_json = Vec::new();
+
+    for tool in tools {
+        match tool {
+            ToolSpec::Function(function) => {
+                tools_json.push(chat_completions_function_tool_json(function));
+            }
+            ToolSpec::Freeform(freeform) => {
+                let input_description = format!(
+                    "{}\n\nSyntax: {}\n\n{}",
+                    freeform.description, freeform.format.syntax, freeform.format.definition
+                );
+                tools_json.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": freeform.name,
+                        "description": freeform.description,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "input": {
+                                    "type": "string",
+                                    "description": input_description
+                                }
+                            },
+                            "required": ["input"],
+                            "additionalProperties": false
+                        }
+                    }
+                }));
+            }
+            ToolSpec::LocalShell {} => {
+                if let ToolSpec::Function(function) = create_shell_tool(false) {
+                    tools_json.push(chat_completions_function_tool_json(&function));
+                }
+            }
+            ToolSpec::ToolSearch { .. }
+            | ToolSpec::ImageGeneration { .. }
+            | ToolSpec::WebSearch { .. } => {}
+        }
+    }
+
+    Ok(tools_json)
+}
+
+fn chat_completions_function_tool_json(function: &ResponsesApiTool) -> serde_json::Value {
+    let mut function_json = json!({
+        "name": function.name,
+        "description": function.description,
+        "parameters": function.parameters,
+    });
+    if function.strict
+        && let Some(obj) = function_json.as_object_mut()
+    {
+        obj.insert("strict".to_string(), json!(true));
+    }
+
+    json!({
+        "type": "function",
+        "function": function_json,
+    })
+}
+
 fn push_tool_spec(
     builder: &mut ToolRegistryBuilder,
     spec: ToolSpec,

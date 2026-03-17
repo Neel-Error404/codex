@@ -30,6 +30,27 @@ When Codex knows which client started the turn, the legacy notify JSON payload a
 
 The generated JSON Schema for `config.toml` lives at `codex-rs/core/config.schema.json`.
 
+## Custom model providers
+
+Custom `model_providers` can now opt into either `wire_api = "responses"` or
+`wire_api = "chat"` depending on which OpenAI-compatible endpoint the provider
+supports.
+
+If a provider does not expose a Codex-compatible `/models` catalog, you can pin
+picker-visible model slugs directly in `config.toml`:
+
+```toml
+[model_providers.azure_foundry]
+name = "Azure Foundry"
+base_url = "https://example.services.ai.azure.com/models"
+env_key = "AZURE_INFERENCE_CREDENTIAL"
+wire_api = "chat"
+models = ["kimi-k2", "deepseek-v3.2"]
+```
+
+The active provider for a session comes from `model_provider`, and Codex now
+uses that effective provider when refreshing models and building the picker.
+
 ## SQLite State DB
 
 Codex stores the SQLite-backed state DB under `sqlite_home` (config key) or the

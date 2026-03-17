@@ -73,6 +73,7 @@ fn provider_for(base_url: String) -> ModelProviderInfo {
         stream_idle_timeout_ms: Some(5_000),
         requires_openai_auth: false,
         supports_websockets: false,
+        models: None,
     }
 }
 
@@ -550,6 +551,36 @@ fn build_available_models_picks_default_after_hiding_hidden_models() {
     let available = manager.build_available_models(vec![hidden_model, visible_model]);
 
     assert_eq!(available, vec![expected_hidden, expected_visible]);
+}
+
+#[test]
+fn build_available_models_includes_provider_models_from_config() {
+    let codex_home = tempdir().expect("temp dir");
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let mut provider = provider_for("http://example.test".to_string());
+    provider.models = Some(vec![
+        "kimi-k2".to_string(),
+        "deepseek-v3.2".to_string(),
+        "  ".to_string(),
+        "kimi-k2".to_string(),
+    ]);
+    let manager = ModelsManager::with_provider_for_tests(
+        codex_home.path().to_path_buf(),
+        auth_manager,
+        provider,
+    );
+
+    let available = manager.build_available_models(Vec::new());
+
+    assert_eq!(available.len(), 2);
+    assert_eq!(available[0].model, "kimi-k2");
+    assert_eq!(available[1].model, "deepseek-v3.2");
+    assert!(available.iter().all(|preset| preset.show_in_picker));
+    assert_eq!(
+        available.iter().filter(|preset| preset.is_default).count(),
+        1,
+        "one provider model should be marked as default"
+    );
 }
 
 #[test]

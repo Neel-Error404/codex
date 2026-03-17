@@ -2793,3 +2793,39 @@ fn chat_tools_include_top_level_name() {
         })]
     );
 }
+
+#[test]
+fn chat_completions_maps_function_tools_to_function_tool_json() {
+    let properties =
+        BTreeMap::from([("foo".to_string(), JsonSchema::String { description: None })]);
+    let tools = vec![ToolSpec::Function(ResponsesApiTool {
+        name: "demo".to_string(),
+        description: "A demo tool".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: None,
+        },
+        output_schema: None,
+    })];
+
+    let chat_json = create_tools_json_for_chat_completions(&tools).unwrap();
+    assert_eq!(
+        chat_json,
+        vec![json!({
+            "type": "function",
+            "function": {
+                "name": "demo",
+                "description": "A demo tool",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "foo": { "type": "string" }
+                    },
+                },
+            }
+        })]
+    );
+}

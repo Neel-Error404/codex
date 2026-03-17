@@ -835,6 +835,13 @@
           "description": "Additional HTTP headers to include in requests to this provider where the (key, value) pairs are the header name and value.",
           "type": "object"
         },
+        "models": {
+          "description": "Optional model slugs to surface in the picker when using this provider.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "name": {
           "description": "Friendly display name.",
           "type": "string"
@@ -1741,6 +1748,13 @@
           "description": "The Responses API exposed by OpenAI at `/v1/responses`.",
           "enum": [
             "responses"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The Chat Completions API exposed by providers at `/v1/chat/completions`.",
+          "enum": [
+            "chat"
           ],
           "type": "string"
         }
