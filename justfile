@@ -10,6 +10,11 @@ alias c := codex
 codex *args:
     cargo run --bin codex -- "$@"
 
+# Run the built branch-local binary, preferring release and falling back to debug.
+[no-cd]
+codex-dev *args:
+    ./codex-dev.ps1 "$@"
+
 # `codex exec`
 exec *args:
     cargo run --bin codex -- exec "$@"

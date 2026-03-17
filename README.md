@@ -28,6 +28,18 @@ brew install --cask codex
 
 Then simply run `codex` to get started.
 
+For a local branch build in this workspace, you can also run:
+
+```shell
+./codex-dev.ps1
+```
+
+On Windows Command Prompt:
+
+```bat
+codex-dev.cmd
+```
+
 <details>
 <summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
 
