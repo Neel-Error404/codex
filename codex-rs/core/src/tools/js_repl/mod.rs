@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
@@ -8,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -36,6 +38,7 @@ use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::exec::ExecExpiration;
 use crate::exec_env::create_env;
+use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
 use crate::original_image_detail::normalize_output_image_detail;
 use crate::sandboxing::CommandSpec;
@@ -58,7 +61,19 @@ const JS_REPL_STDERR_TAIL_SEPARATOR: &str = " | ";
 const JS_REPL_EXEC_ID_LOG_LIMIT: usize = 8;
 const JS_REPL_MODEL_DIAG_STDERR_MAX_BYTES: usize = 1_024;
 const JS_REPL_MODEL_DIAG_ERROR_MAX_BYTES: usize = 256;
+const SPARSE_CONTEXT_FILE_SUMMARIES_MAX_ENTRIES: usize = 64;
+const SPARSE_CONTEXT_FILE_SUMMARY_PATH_MAX_BYTES: usize = 256;
+const SPARSE_CONTEXT_FILE_SUMMARY_MAX_BYTES: usize = 1_024;
+const SPARSE_CONTEXT_FILE_SUMMARIES_TOTAL_MAX_BYTES: usize = 24 * 1_024;
 const JS_REPL_TOOL_RESPONSE_TEXT_PREVIEW_MAX_BYTES: usize = 512;
+const JS_REPL_SPARSE_CONTEXT_SEED_METRIC: &str = "codex.js_repl.sparse_context.seed";
+const JS_REPL_SPARSE_CONTEXT_SEED_PARSE_FAILURE_METRIC: &str =
+    "codex.js_repl.sparse_context.seed_parse_failure";
+const JS_REPL_SPARSE_CONTEXT_SYNC_METRIC: &str = "codex.js_repl.sparse_context.sync";
+const JS_REPL_SPARSE_CONTEXT_FILE_SUMMARY_TRUNCATION_METRIC: &str =
+    "codex.js_repl.sparse_context.file_summary_truncation";
+const JS_REPL_SPARSE_CONTEXT_PERSIST_PAYLOAD_BYTES_METRIC: &str =
+    "codex.js_repl.sparse_context.persist_payload_bytes";
 
 /// Per-task js_repl handle stored on the turn context.
 pub(crate) struct JsReplHandle {
@@ -118,8 +133,11 @@ struct KernelState {
     recent_stderr: Arc<Mutex<VecDeque<String>>>,
     stdin: Arc<Mutex<ChildStdin>>,
     pending_execs: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ExecResultMessage>>>>,
+    pending_sparse_context_syncs:
+        Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<SparseContextSyncResultMessage>>>>,
     exec_contexts: Arc<Mutex<HashMap<String, ExecContext>>>,
     top_level_exec_state: TopLevelExecState,
+    seeded_sparse_context_payload: Option<SparseContextPayload>,
     shutdown: CancellationToken,
 }
 
@@ -362,6 +380,7 @@ pub struct JsReplManager {
     node_module_dirs: Vec<PathBuf>,
     tmp_dir: tempfile::TempDir,
     kernel: Arc<Mutex<Option<KernelState>>>,
+    persistent_sparse_context: Arc<Mutex<Option<SparseContextPayload>>>,
     exec_lock: Arc<tokio::sync::Semaphore>,
     exec_tool_calls: Arc<Mutex<HashMap<String, ExecToolCalls>>>,
 }
@@ -380,6 +399,7 @@ impl JsReplManager {
             node_module_dirs,
             tmp_dir,
             kernel: Arc::new(Mutex::new(None)),
+            persistent_sparse_context: Arc::new(Mutex::new(None)),
             exec_lock: Arc::new(tokio::sync::Semaphore::new(1)),
             exec_tool_calls: Arc::new(Mutex::new(HashMap::new())),
         });
@@ -838,7 +858,14 @@ impl JsReplManager {
             FunctionCallError::RespondToModel("js_repl execution unavailable".to_string())
         })?;
 
-        let (stdin, pending_execs, exec_contexts, child, recent_stderr) = {
+        let (
+            stdin,
+            pending_execs,
+            pending_sparse_context_syncs,
+            exec_contexts,
+            child,
+            recent_stderr,
+        ) = {
             let mut kernel = self.kernel.lock().await;
             if kernel.is_none() {
                 let dependency_env = session.dependency_env().await;
@@ -868,11 +895,22 @@ impl JsReplManager {
             (
                 Arc::clone(&state.stdin),
                 Arc::clone(&state.pending_execs),
+                Arc::clone(&state.pending_sparse_context_syncs),
                 Arc::clone(&state.exec_contexts),
                 Arc::clone(&state.child),
                 Arc::clone(&state.recent_stderr),
             )
         };
+
+        self.maybe_seed_sparse_context(
+            session.as_ref(),
+            turn.as_ref(),
+            &stdin,
+            &pending_sparse_context_syncs,
+            &child,
+            &recent_stderr,
+        )
+        .await?;
 
         let (req_id, rx) = {
             let req_id = Uuid::new_v4().to_string();
@@ -982,15 +1020,104 @@ impl JsReplManager {
         };
 
         match response {
-            ExecResultMessage::Ok { content_items } => {
+            ExecResultMessage::Ok {
+                content_items,
+                sparse_context,
+            } => {
+                if turn.features.enabled(Feature::SparseContext) {
+                    if let Some(sparse_context) = sparse_context {
+                        self.persist_sparse_context_payload(session.as_ref(), sparse_context)
+                            .await;
+                    }
+                }
                 let (output, content_items) = split_exec_result_content_items(content_items);
                 Ok(JsExecResult {
                     output,
                     content_items,
                 })
             }
-            ExecResultMessage::Err { message } => Err(FunctionCallError::RespondToModel(message)),
+            ExecResultMessage::Err {
+                message,
+                sparse_context,
+            } => {
+                if turn.features.enabled(Feature::SparseContext) {
+                    if let Some(sparse_context) = sparse_context {
+                        self.persist_sparse_context_payload(session.as_ref(), sparse_context)
+                            .await;
+                    }
+                }
+                Err(FunctionCallError::RespondToModel(message))
+            }
         }
+    }
+
+    async fn maybe_seed_sparse_context(
+        &self,
+        session: &Session,
+        turn: &TurnContext,
+        stdin: &Arc<Mutex<ChildStdin>>,
+        pending_sparse_context_syncs: &Arc<
+            Mutex<HashMap<String, tokio::sync::oneshot::Sender<SparseContextSyncResultMessage>>>,
+        >,
+        child: &Arc<Mutex<Child>>,
+        recent_stderr: &Arc<Mutex<VecDeque<String>>>,
+    ) -> Result<(), FunctionCallError> {
+        if !turn.features.enabled(Feature::SparseContext) {
+            return Ok(());
+        }
+
+        let latest_synopsis = crate::state_db::get_thread_synopsis_structured(
+            session.services.state_db.as_deref(),
+            session.conversation_id,
+            "js_repl_seed_sparse_context",
+        )
+        .await;
+        let cached_payload = self.persistent_sparse_context.lock().await.clone();
+        let persisted_payload = if cached_payload.is_none() {
+            crate::state_db::get_thread_sparse_context(
+                session.services.state_db.as_deref(),
+                session.conversation_id,
+                "js_repl_seed_sparse_context",
+            )
+            .await
+        } else {
+            None
+        };
+        let resolution = resolve_sparse_context_seed_payload(
+            latest_synopsis.as_ref(),
+            cached_payload,
+            persisted_payload.as_deref(),
+        );
+        emit_sparse_context_seed_metrics(&session.services.session_telemetry, &resolution);
+        let seed_payload = resolution.payload;
+
+        {
+            let kernel = self.kernel.lock().await;
+            if kernel
+                .as_ref()
+                .and_then(|state| state.seeded_sparse_context_payload.as_ref())
+                == Some(&seed_payload)
+            {
+                return Ok(());
+            }
+        }
+
+        self.sync_sparse_context(
+            &session.services.session_telemetry,
+            stdin,
+            pending_sparse_context_syncs,
+            seed_payload.clone(),
+            5_000,
+            child,
+            recent_stderr,
+        )
+        .await?;
+
+        let mut kernel = self.kernel.lock().await;
+        if let Some(state) = kernel.as_mut() {
+            state.seeded_sparse_context_payload = Some(seed_payload);
+        }
+        Ok(())
     }
 
     async fn start_kernel(
@@ -1111,6 +1238,9 @@ impl JsReplManager {
         let pending_execs: Arc<
             Mutex<HashMap<String, tokio::sync::oneshot::Sender<ExecResultMessage>>>,
         > = Arc::new(Mutex::new(HashMap::new()));
+        let pending_sparse_context_syncs: Arc<
+            Mutex<HashMap<String, tokio::sync::oneshot::Sender<SparseContextSyncResultMessage>>>,
+        > = Arc::new(Mutex::new(HashMap::new()));
         let exec_contexts: Arc<Mutex<HashMap<String, ExecContext>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let stdin_arc = Arc::new(Mutex::new(stdin));
@@ -1125,6 +1255,7 @@ impl JsReplManager {
             Arc::clone(&self.kernel),
             Arc::clone(&recent_stderr),
             Arc::clone(&pending_execs),
+            Arc::clone(&pending_sparse_context_syncs),
             Arc::clone(&exec_contexts),
             Arc::clone(&self.exec_tool_calls),
             Arc::clone(&stdin_arc),
@@ -1145,10 +1276,140 @@ impl JsReplManager {
             recent_stderr,
             stdin: stdin_arc,
             pending_execs,
+            pending_sparse_context_syncs,
             exec_contexts,
             top_level_exec_state: TopLevelExecState::Idle,
+            seeded_sparse_context_payload: None,
             shutdown,
         })
+    }
+
+    async fn sync_sparse_context(
+        &self,
+        session_telemetry: &SessionTelemetry,
+        stdin: &Arc<Mutex<ChildStdin>>,
+        pending_sparse_context_syncs: &Arc<
+            Mutex<HashMap<String, tokio::sync::oneshot::Sender<SparseContextSyncResultMessage>>>,
+        >,
+        payload: SparseContextPayload,
+        timeout_ms: u64,
+        child: &Arc<Mutex<Child>>,
+        recent_stderr: &Arc<Mutex<VecDeque<String>>>,
+    ) -> Result<(), FunctionCallError> {
+        let req_id = format!("sparse-context-{}", Uuid::new_v4());
+        let rx = {
+            let mut pending = pending_sparse_context_syncs.lock().await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            pending.insert(req_id.clone(), tx);
+            rx
+        };
+
+        let message = HostToKernel::SyncSparseContext {
+            id: req_id.clone(),
+            payload,
+        };
+
+        if let Err(err) = Self::write_message(stdin, &message).await {
+            pending_sparse_context_syncs.lock().await.remove(&req_id);
+            emit_sparse_context_sync_metric(session_telemetry, "write_failed");
+            let snapshot = Self::kernel_debug_snapshot(child, recent_stderr).await;
+            let err_message = err.to_string();
+            let message =
+                if should_include_model_diagnostics_for_write_error(&err_message, &snapshot) {
+                    with_model_kernel_failure_message(
+                        &err_message,
+                        "sparse_context_write_failed",
+                        Some(&err_message),
+                        &snapshot,
+                    )
+                } else {
+                    err_message
+                };
+            return Err(FunctionCallError::RespondToModel(message));
+        }
+
+        let response = match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(_)) => {
+                pending_sparse_context_syncs.lock().await.remove(&req_id);
+                emit_sparse_context_sync_metric(session_telemetry, "response_channel_closed");
+                let snapshot = Self::kernel_debug_snapshot(child, recent_stderr).await;
+                let message = if is_kernel_status_exited(&snapshot.status) {
+                    with_model_kernel_failure_message(
+                        "js_repl kernel closed unexpectedly during sparse-context sync",
+                        "sparse_context_response_channel_closed",
+                        None,
+                        &snapshot,
+                    )
+                } else {
+                    "js_repl kernel closed unexpectedly during sparse-context sync".to_string()
+                };
+                return Err(FunctionCallError::RespondToModel(message));
+            }
+            Err(_) => {
+                self.reset_kernel().await;
+                emit_sparse_context_sync_metric(session_telemetry, "timeout");
+                return Err(FunctionCallError::RespondToModel(
+                    "js_repl sparse-context sync timed out; kernel reset, rerun your request"
+                        .to_string(),
+                ));
+            }
+        };
+
+        match response {
+            SparseContextSyncResultMessage::Ok => {
+                emit_sparse_context_sync_metric(session_telemetry, "ok");
+                Ok(())
+            }
+            SparseContextSyncResultMessage::Err { message } => {
+                emit_sparse_context_sync_metric(session_telemetry, "kernel_err");
+                Err(FunctionCallError::RespondToModel(format!(
+                    "js_repl sparse-context sync failed: {message}"
+                )))
+            }
+        }
+    }
+
+    async fn persist_sparse_context_payload(
+        &self,
+        session: &Session,
+        payload: SparseContextPayload,
+    ) {
+        let (payload, normalization_stats) =
+            normalize_sparse_context_payload_for_host_with_stats(payload);
+        {
+            let mut persistent_sparse_context = self.persistent_sparse_context.lock().await;
+            *persistent_sparse_context = Some(payload.clone());
+        }
+        {
+            let mut kernel = self.kernel.lock().await;
+            if let Some(state) = kernel.as_mut() {
+                state.seeded_sparse_context_payload = Some(payload.clone());
+            }
+        }
+        if let Some(synopsis_json) = sparse_context_payload_synopsis_json(&payload) {
+            crate::state_db::persist_thread_synopsis(
+                session.services.state_db.as_deref(),
+                session.conversation_id,
+                &synopsis_json,
+                "js_repl_persist_sparse_context",
+            )
+            .await;
+        }
+        if let Some(payload_json) = sparse_context_payload_to_persisted_json(&payload) {
+            emit_sparse_context_persist_metrics(
+                &session.services.session_telemetry,
+                &normalization_stats,
+                payload_json.len(),
+            );
+            crate::state_db::persist_thread_sparse_context(
+                session.services.state_db.as_deref(),
+                session.conversation_id,
+                &payload_json,
+                "js_repl_persist_sparse_context",
+            )
+            .await;
+        }
     }
 
     async fn write_kernel_script(&self) -> Result<PathBuf, std::io::Error> {
@@ -1269,6 +1530,9 @@ impl JsReplManager {
         manager_kernel: Arc<Mutex<Option<KernelState>>>,
         recent_stderr: Arc<Mutex<VecDeque<String>>>,
         pending_execs: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ExecResultMessage>>>>,
+        pending_sparse_context_syncs: Arc<
+            Mutex<HashMap<String, tokio::sync::oneshot::Sender<SparseContextSyncResultMessage>>>,
+        >,
         exec_contexts: Arc<Mutex<HashMap<String, ExecContext>>>,
         exec_tool_calls: Arc<Mutex<HashMap<String, ExecToolCalls>>>,
         stdin: Arc<Mutex<ChildStdin>>,
@@ -1300,6 +1564,7 @@ impl JsReplManager {
                     ok,
                     output,
                     error,
+                    sparse_context,
                 } => {
                     JsReplManager::wait_for_exec_tool_calls_map(&exec_tool_calls, &id).await;
                     let content_items = {
@@ -1321,17 +1586,37 @@ impl JsReplManager {
                                     output,
                                     content_items,
                                 ),
+                                sparse_context,
                             }
                         } else {
                             ExecResultMessage::Err {
                                 message: error
                                     .unwrap_or_else(|| "js_repl execution failed".to_string()),
+                                sparse_context,
                             }
                         };
                         let _ = tx.send(payload);
                     }
                     exec_contexts.lock().await.remove(&id);
                     JsReplManager::clear_exec_tool_calls_map(&exec_tool_calls, &id).await;
+                }
+                KernelToHost::SparseContextResult { id, ok, error } => {
+                    let tx = {
+                        let mut pending = pending_sparse_context_syncs.lock().await;
+                        pending.remove(&id)
+                    };
+                    if let Some(tx) = tx {
+                        let payload = if ok {
+                            SparseContextSyncResultMessage::Ok
+                        } else {
+                            SparseContextSyncResultMessage::Err {
+                                message: error.unwrap_or_else(|| {
+                                    "js_repl sparse-context sync failed".to_string()
+                                }),
+                            }
+                        };
+                        let _ = tx.send(payload);
+                    }
                 }
                 KernelToHost::EmitImage(req) => {
                     let exec_id = req.exec_id.clone();
@@ -1503,9 +1788,17 @@ impl JsReplManager {
         for (_id, tx) in pending.drain() {
             let _ = tx.send(ExecResultMessage::Err {
                 message: kernel_exit_message.clone(),
+                sparse_context: None,
             });
         }
         drop(pending);
+        let mut pending_sparse_context_syncs = pending_sparse_context_syncs.lock().await;
+        for (_id, tx) in pending_sparse_context_syncs.drain() {
+            let _ = tx.send(SparseContextSyncResultMessage::Err {
+                message: kernel_exit_message.clone(),
+            });
+        }
+        drop(pending_sparse_context_syncs);
         if !pending_exec_ids.is_empty() {
             Self::clear_top_level_exec_if_matches_any_map(&manager_kernel, &pending_exec_ids).await;
         }
@@ -1737,6 +2030,303 @@ fn is_js_repl_internal_tool(name: &str) -> bool {
     matches!(name, "js_repl" | "js_repl_reset")
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SparseContextPayload {
+    #[serde(default)]
+    thread_synopsis: Option<crate::compact::ThreadSynopsis>,
+    facts: crate::compact::ThreadSynopsis,
+    #[serde(default)]
+    file_summaries: BTreeMap<String, String>,
+    #[serde(default)]
+    open_questions: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SparseContextSeedSource {
+    MemoryCache,
+    StateDbBlob,
+    SynopsisOnly,
+}
+
+impl SparseContextSeedSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MemoryCache => "memory_cache",
+            Self::StateDbBlob => "state_db_blob",
+            Self::SynopsisOnly => "synopsis_only",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SparseContextSeedResolution {
+    payload: SparseContextPayload,
+    source: SparseContextSeedSource,
+    persisted_blob_parse_failed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SparseContextNormalizationStats {
+    truncated_path_count: usize,
+    truncated_summary_count: usize,
+    dropped_empty_count: usize,
+    dropped_entry_limit_count: usize,
+    dropped_total_bytes_count: usize,
+}
+
+impl SparseContextNormalizationStats {
+    fn file_summaries_truncated(&self) -> bool {
+        self.truncated_path_count > 0
+            || self.truncated_summary_count > 0
+            || self.dropped_entry_limit_count > 0
+            || self.dropped_total_bytes_count > 0
+    }
+}
+
+fn build_sparse_context_seed_payload(
+    synopsis: Option<&crate::compact::ThreadSynopsis>,
+) -> SparseContextPayload {
+    let facts = synopsis
+        .cloned()
+        .unwrap_or_else(|| crate::compact::ThreadSynopsis {
+            core_facts: String::new(),
+            pending_steps: Vec::new(),
+            constraints: Vec::new(),
+        });
+
+    SparseContextPayload {
+        thread_synopsis: synopsis.cloned(),
+        facts,
+        file_summaries: BTreeMap::new(),
+        open_questions: Vec::new(),
+    }
+}
+
+fn resolve_sparse_context_seed_payload(
+    synopsis: Option<&crate::compact::ThreadSynopsis>,
+    cached_payload: Option<SparseContextPayload>,
+    persisted_payload_raw: Option<&str>,
+) -> SparseContextSeedResolution {
+    if let Some(payload) = cached_payload {
+        return SparseContextSeedResolution {
+            payload: merge_sparse_context_payload_with_synopsis(payload, synopsis),
+            source: SparseContextSeedSource::MemoryCache,
+            persisted_blob_parse_failed: false,
+        };
+    }
+
+    if let Some(raw) = persisted_payload_raw {
+        if let Some(payload) = parse_sparse_context_payload_from_persisted(raw) {
+            return SparseContextSeedResolution {
+                payload: merge_sparse_context_payload_with_synopsis(payload, synopsis),
+                source: SparseContextSeedSource::StateDbBlob,
+                persisted_blob_parse_failed: false,
+            };
+        }
+    }
+
+    SparseContextSeedResolution {
+        payload: build_sparse_context_seed_payload(synopsis),
+        source: SparseContextSeedSource::SynopsisOnly,
+        persisted_blob_parse_failed: persisted_payload_raw.is_some(),
+    }
+}
+
+fn parse_sparse_context_payload_from_persisted(raw: &str) -> Option<SparseContextPayload> {
+    serde_json::from_str::<SparseContextPayload>(raw)
+        .ok()
+        .map(normalize_sparse_context_payload_for_host)
+}
+
+fn normalize_sparse_context_payload_for_host(
+    payload: SparseContextPayload,
+) -> SparseContextPayload {
+    normalize_sparse_context_payload_for_host_with_stats(payload).0
+}
+
+fn normalize_sparse_context_payload_for_host_with_stats(
+    payload: SparseContextPayload,
+) -> (SparseContextPayload, SparseContextNormalizationStats) {
+    let canonical_synopsis = normalize_thread_synopsis(payload.facts.clone())
+        .or_else(|| payload.thread_synopsis.and_then(normalize_thread_synopsis));
+    let facts = canonical_synopsis
+        .clone()
+        .unwrap_or_else(empty_thread_synopsis);
+    let input_entries: Vec<_> = payload.file_summaries.into_iter().collect();
+    let mut file_summaries = BTreeMap::new();
+    let mut file_summary_total_bytes = 0usize;
+    let mut stats = SparseContextNormalizationStats::default();
+    let input_entry_count = input_entries.len();
+    for (idx, (path, summary)) in input_entries.into_iter().enumerate() {
+        if file_summaries.len() >= SPARSE_CONTEXT_FILE_SUMMARIES_MAX_ENTRIES {
+            stats.dropped_entry_limit_count = input_entry_count.saturating_sub(idx);
+            break;
+        }
+        let path = path.trim();
+        let summary = summary.trim();
+        let bounded_path =
+            truncate_utf8_prefix_by_bytes(path, SPARSE_CONTEXT_FILE_SUMMARY_PATH_MAX_BYTES);
+        let bounded_summary =
+            truncate_utf8_prefix_by_bytes(summary, SPARSE_CONTEXT_FILE_SUMMARY_MAX_BYTES);
+        if bounded_path.len() < path.len() {
+            stats.truncated_path_count += 1;
+        }
+        if bounded_summary.len() < summary.len() {
+            stats.truncated_summary_count += 1;
+        }
+        if bounded_path.is_empty() || bounded_summary.is_empty() {
+            stats.dropped_empty_count += 1;
+            continue;
+        }
+        let entry_bytes = bounded_path.len() + bounded_summary.len();
+        if file_summary_total_bytes + entry_bytes > SPARSE_CONTEXT_FILE_SUMMARIES_TOTAL_MAX_BYTES {
+            stats.dropped_total_bytes_count = input_entry_count.saturating_sub(idx);
+            break;
+        }
+        file_summary_total_bytes += entry_bytes;
+        file_summaries.insert(bounded_path, bounded_summary);
+    }
+    let open_questions = payload
+        .open_questions
+        .into_iter()
+        .map(|question| question.trim().to_string())
+        .filter(|question| !question.is_empty())
+        .collect::<Vec<_>>();
+
+    (
+        SparseContextPayload {
+            thread_synopsis: canonical_synopsis,
+            facts,
+            file_summaries,
+            open_questions,
+        },
+        stats,
+    )
+}
+
+fn merge_sparse_context_payload_with_synopsis(
+    mut payload: SparseContextPayload,
+    synopsis: Option<&crate::compact::ThreadSynopsis>,
+) -> SparseContextPayload {
+    let Some(synopsis) = synopsis.cloned().and_then(normalize_thread_synopsis) else {
+        return normalize_sparse_context_payload_for_host(payload);
+    };
+    payload.thread_synopsis = Some(synopsis.clone());
+    payload.facts = synopsis;
+    normalize_sparse_context_payload_for_host(payload)
+}
+
+fn sparse_context_payload_synopsis_json(payload: &SparseContextPayload) -> Option<String> {
+    payload
+        .thread_synopsis
+        .as_ref()
+        .and_then(|synopsis| serde_json::to_string(synopsis).ok())
+}
+
+fn sparse_context_payload_to_persisted_json(payload: &SparseContextPayload) -> Option<String> {
+    serde_json::to_string(payload).ok()
+}
+
+fn emit_sparse_context_seed_metrics(
+    session_telemetry: &SessionTelemetry,
+    resolution: &SparseContextSeedResolution,
+) {
+    session_telemetry.counter(
+        JS_REPL_SPARSE_CONTEXT_SEED_METRIC,
+        1,
+        &[("source", resolution.source.as_str())],
+    );
+    if resolution.persisted_blob_parse_failed {
+        session_telemetry.counter(
+            JS_REPL_SPARSE_CONTEXT_SEED_PARSE_FAILURE_METRIC,
+            1,
+            &[("source", SparseContextSeedSource::StateDbBlob.as_str())],
+        );
+    }
+}
+
+fn emit_sparse_context_sync_metric(session_telemetry: &SessionTelemetry, status: &str) {
+    session_telemetry.counter(JS_REPL_SPARSE_CONTEXT_SYNC_METRIC, 1, &[("status", status)]);
+}
+
+fn emit_sparse_context_persist_metrics(
+    session_telemetry: &SessionTelemetry,
+    stats: &SparseContextNormalizationStats,
+    payload_bytes: usize,
+) {
+    if stats.file_summaries_truncated() {
+        if stats.truncated_path_count > 0 {
+            session_telemetry.counter(
+                JS_REPL_SPARSE_CONTEXT_FILE_SUMMARY_TRUNCATION_METRIC,
+                stats.truncated_path_count as i64,
+                &[("reason", "path_bytes")],
+            );
+        }
+        if stats.truncated_summary_count > 0 {
+            session_telemetry.counter(
+                JS_REPL_SPARSE_CONTEXT_FILE_SUMMARY_TRUNCATION_METRIC,
+                stats.truncated_summary_count as i64,
+                &[("reason", "summary_bytes")],
+            );
+        }
+        if stats.dropped_entry_limit_count > 0 {
+            session_telemetry.counter(
+                JS_REPL_SPARSE_CONTEXT_FILE_SUMMARY_TRUNCATION_METRIC,
+                stats.dropped_entry_limit_count as i64,
+                &[("reason", "entry_limit")],
+            );
+        }
+        if stats.dropped_total_bytes_count > 0 {
+            session_telemetry.counter(
+                JS_REPL_SPARSE_CONTEXT_FILE_SUMMARY_TRUNCATION_METRIC,
+                stats.dropped_total_bytes_count as i64,
+                &[("reason", "total_bytes")],
+            );
+        }
+    }
+    session_telemetry.histogram(
+        JS_REPL_SPARSE_CONTEXT_PERSIST_PAYLOAD_BYTES_METRIC,
+        payload_bytes as i64,
+        &[],
+    );
+}
+
+fn normalize_thread_synopsis(
+    synopsis: crate::compact::ThreadSynopsis,
+) -> Option<crate::compact::ThreadSynopsis> {
+    let core_facts = synopsis.core_facts.trim().to_string();
+    let pending_steps = synopsis
+        .pending_steps
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let constraints = synopsis
+        .constraints
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+
+    if core_facts.is_empty() && pending_steps.is_empty() && constraints.is_empty() {
+        None
+    } else {
+        Some(crate::compact::ThreadSynopsis {
+            core_facts,
+            pending_steps,
+            constraints,
+        })
+    }
+}
+
+fn empty_thread_synopsis() -> crate::compact::ThreadSynopsis {
+    crate::compact::ThreadSynopsis {
+        core_facts: String::new(),
+        pending_steps: Vec::new(),
+        constraints: Vec::new(),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum KernelToHost {
@@ -1744,6 +2334,14 @@ enum KernelToHost {
         id: String,
         ok: bool,
         output: String,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        sparse_context: Option<SparseContextPayload>,
+    },
+    SparseContextResult {
+        id: String,
+        ok: bool,
         #[serde(default)]
         error: Option<String>,
     },
@@ -1759,6 +2357,10 @@ enum HostToKernel {
         code: String,
         #[serde(default)]
         timeout_ms: Option<u64>,
+    },
+    SyncSparseContext {
+        id: String,
+        payload: SparseContextPayload,
     },
     RunToolResult(RunToolResult),
     EmitImageResult(EmitImageResult),
@@ -1803,10 +2405,18 @@ struct EmitImageResult {
 enum ExecResultMessage {
     Ok {
         content_items: Vec<FunctionCallOutputContentItem>,
+        sparse_context: Option<SparseContextPayload>,
     },
     Err {
         message: String,
+        sparse_context: Option<SparseContextPayload>,
     },
+}
+
+#[derive(Debug)]
+enum SparseContextSyncResultMessage {
+    Ok,
+    Err { message: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

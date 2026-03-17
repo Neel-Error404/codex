@@ -1106,6 +1106,110 @@ function formatErrorMessage(error) {
   return String(error);
 }
 
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeStringArray(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((entry) => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function normalizeThreadSynopsis(value) {
+  if (value == null) {
+    return null;
+  }
+  if (!isPlainObject(value)) {
+    throw new Error("invalid sparse-context thread_synopsis payload");
+  }
+  return {
+    core_facts:
+      typeof value.core_facts === "string" ? value.core_facts.trim() : "",
+    pending_steps: normalizeStringArray(value.pending_steps),
+    constraints: normalizeStringArray(value.constraints),
+  };
+}
+
+function normalizeFacts(value) {
+  const normalized = normalizeThreadSynopsis(value);
+  if (normalized === null) {
+    return {
+      core_facts: "",
+      pending_steps: [],
+      constraints: [],
+    };
+  }
+  return normalized;
+}
+
+function normalizeFileSummaries(value) {
+  if (!isPlainObject(value)) {
+    return {};
+  }
+
+  const normalized = {};
+  for (const [key, summary] of Object.entries(value)) {
+    if (typeof key === "string" && typeof summary === "string" && key.trim()) {
+      normalized[key] = summary;
+    }
+  }
+  return normalized;
+}
+
+function normalizeSparseContextPayload(message) {
+  const payload = isPlainObject(message.payload) ? message.payload : {};
+  return {
+    threadSynopsis: normalizeThreadSynopsis(payload.thread_synopsis),
+    facts: normalizeFacts(payload.facts),
+    fileSummaries: normalizeFileSummaries(payload.file_summaries),
+    openQuestions: normalizeStringArray(payload.open_questions),
+  };
+}
+
+function getSparseContextSnapshot() {
+  const facts = normalizeFacts(context.facts);
+  const threadSynopsis =
+    normalizeThreadSynopsis(context.thread_synopsis) ?? normalizeFacts(facts);
+  return {
+    thread_synopsis: threadSynopsis,
+    facts,
+    file_summaries: normalizeFileSummaries(context.file_summaries),
+    open_questions: normalizeStringArray(context.open_questions),
+  };
+}
+
+function handleSyncSparseContext(message) {
+  try {
+    const payload = normalizeSparseContextPayload(message);
+    context.thread_synopsis =
+      payload.threadSynopsis === null
+        ? null
+        : Object.freeze(payload.threadSynopsis);
+    context.facts = payload.facts;
+    context.file_summaries = payload.fileSummaries;
+    context.open_questions = payload.openQuestions;
+
+    send({
+      type: "sparse_context_result",
+      id: message.id,
+      ok: true,
+      error: null,
+    });
+  } catch (error) {
+    send({
+      type: "sparse_context_result",
+      id: message.id,
+      ok: false,
+      error: formatErrorMessage(error),
+    });
+  }
+}
+
 function sendFatalExecResultSync(kind, error) {
   if (!activeExecId) {
     return;
@@ -1647,6 +1751,7 @@ async function handleExec(message) {
       ok: true,
       output,
       error: null,
+      sparse_context: getSparseContextSnapshot(),
     });
   } catch (error) {
     const { bindings: committedBindings, committedCurrentBindingCount } =
@@ -1678,6 +1783,7 @@ async function handleExec(message) {
       ok: false,
       output: "",
       error: error && error.message ? error.message : String(error),
+      sparse_context: getSparseContextSnapshot(),
     });
   } finally {
     if (activeExecId === message.id) {
@@ -1727,6 +1833,10 @@ function handleInputLine(line) {
 
   if (message.type === "exec") {
     queue = queue.then(() => handleExec(message));
+    return;
+  }
+  if (message.type === "sync_sparse_context") {
+    handleSyncSparseContext(message);
     return;
   }
   if (message.type === "run_tool_result") {

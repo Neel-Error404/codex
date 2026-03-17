@@ -3428,6 +3428,17 @@ impl Session {
         {
             developer_sections.push(model_switch_message.into_text());
         }
+        if let Some(thread_synopsis) = state_db::get_thread_synopsis(
+            self.services.state_db.as_deref(),
+            self.conversation_id,
+            "build_initial_context",
+        )
+        .await
+        {
+            developer_sections.push(format!(
+                "<thread_synopsis>\n{thread_synopsis}\n</thread_synopsis>"
+            ));
+        }
         developer_sections.push(
             DeveloperInstructions::from_policy(
                 turn_context.sandbox_policy.get(),
@@ -3459,6 +3470,14 @@ impl Session {
                 build_memory_tool_developer_instructions(&turn_context.config.codex_home).await
         {
             developer_sections.push(memory_prompt);
+        }
+        if turn_context.features.enabled(Feature::SparseContext) {
+            let sparse_context_instructions = if turn_context.features.enabled(Feature::JsRepl) {
+                "Use sparse context and recursive inspection. Do not load large amounts of code or history upfront. Use `js_repl` as a persistent scratchpad, store intermediate findings in top-level variables, and inspect on demand with `await codex.tool(\"tool_search\", ...)`, `await codex.tool(\"list_dir\", ...)`, `await codex.tool(\"grep_files\", ...)`, and `await codex.tool(\"read_file\", ...)`. The scratchpad is pre-seeded with `thread_synopsis`, `facts`, `file_summaries`, and `open_questions`; update them as you learn more. Prefer targeted searches, directory listing, and small file slices over whole-file reads. Re-read source-of-truth details when needed instead of trusting stale summaries, and use shell tools only when the targeted inspection tools are insufficient."
+            } else {
+                "Use sparse context: inspect on demand instead of loading large amounts of code or history upfront. Prefer targeted search, file reads, and small summaries. Keep only the facts needed for the current sub-task, and re-fetch details when needed."
+            };
+            developer_sections.push(sparse_context_instructions.to_string());
         }
         // Add developer instructions from collaboration_mode if they exist and are non-empty
         if let Some(collab_instructions) =

@@ -3482,6 +3482,195 @@ async fn build_initial_context_uses_previous_realtime_state() {
 }
 
 #[tokio::test]
+async fn build_initial_context_includes_thread_synopsis_from_state_db() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let sqlite_home = tempfile::tempdir().expect("create sqlite tempdir");
+    let state_db = codex_state::StateRuntime::init(
+        sqlite_home.path().to_path_buf(),
+        "test-provider".to_string(),
+    )
+    .await
+    .expect("state db should initialize");
+
+    let mut metadata = codex_state::ThreadMetadataBuilder::new(
+        session.conversation_id,
+        sqlite_home.path().join("rollout.jsonl"),
+        chrono::Utc::now(),
+        codex_protocol::protocol::SessionSource::Exec,
+    )
+    .build("test-provider");
+    metadata.cwd = turn_context.cwd.clone();
+    state_db
+        .upsert_thread(&metadata)
+        .await
+        .expect("thread metadata should persist");
+    state_db
+        .upsert_thread_synopsis(
+            session.conversation_id,
+            r#"{"core_facts":"User is optimizing for low-cost, high-accuracy runs.","pending_steps":["Implement tool search"],"constraints":["Keep costs low"]}"#,
+        )
+        .await
+        .expect("thread synopsis should persist");
+
+    session.services.state_db = Some(state_db);
+
+    let initial_context = session.build_initial_context(&turn_context).await;
+    let developer_texts = developer_input_texts(&initial_context);
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("low-cost, high-accuracy runs")),
+        "expected stored synopsis in developer context, got {developer_texts:?}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("Implement tool search")),
+        "expected structured pending steps in developer context, got {developer_texts:?}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("Keep costs low")),
+        "expected structured constraints in developer context, got {developer_texts:?}"
+    );
+    assert!(
+        !initial_context.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::Message { role, content, .. }
+                    if role == "user"
+                        && content.iter().any(|content_item| matches!(
+                            content_item,
+                            ContentItem::InputText { text }
+                                if text.contains("low-cost, high-accuracy runs")
+                        ))
+            )
+        }),
+        "did not expect stored synopsis to be exposed as user-visible context"
+    );
+}
+
+#[tokio::test]
+async fn build_initial_context_includes_legacy_plain_text_thread_synopsis_from_state_db() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let sqlite_home = tempfile::tempdir().expect("create sqlite tempdir");
+    let state_db = codex_state::StateRuntime::init(
+        sqlite_home.path().to_path_buf(),
+        "test-provider".to_string(),
+    )
+    .await
+    .expect("state db should initialize");
+
+    let mut metadata = codex_state::ThreadMetadataBuilder::new(
+        session.conversation_id,
+        sqlite_home.path().join("rollout.jsonl"),
+        chrono::Utc::now(),
+        codex_protocol::protocol::SessionSource::Exec,
+    )
+    .build("test-provider");
+    metadata.cwd = turn_context.cwd.clone();
+    state_db
+        .upsert_thread(&metadata)
+        .await
+        .expect("thread metadata should persist");
+    state_db
+        .upsert_thread_synopsis(
+            session.conversation_id,
+            "Legacy synopsis: keep the current repository aligned with upstream.",
+        )
+        .await
+        .expect("thread synopsis should persist");
+
+    session.services.state_db = Some(state_db);
+
+    let initial_context = session.build_initial_context(&turn_context).await;
+    let developer_texts = developer_input_texts(&initial_context);
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("aligned with upstream")),
+        "expected legacy synopsis in developer context, got {developer_texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn build_initial_context_includes_sparse_context_scaffold_when_enabled() {
+    let (session, mut turn_context) = make_session_and_context().await;
+    turn_context
+        .features
+        .enable(crate::features::Feature::JsRepl)
+        .expect("enable js_repl feature");
+    turn_context
+        .features
+        .enable(crate::features::Feature::SparseContext)
+        .expect("enable sparse context feature");
+
+    let initial_context = session.build_initial_context(&turn_context).await;
+    let developer_texts = developer_input_texts(&initial_context);
+
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("inspect on demand")),
+        "expected sparse-context scaffold in developer context, got {developer_texts:?}"
+    );
+    assert!(
+        developer_texts.iter().any(|text| text.contains("js_repl")),
+        "expected sparse-context scaffold to mention js_repl, got {developer_texts:?}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("codex.tool")),
+        "expected sparse-context scaffold to mention codex.tool, got {developer_texts:?}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("grep_files")),
+        "expected sparse-context scaffold to mention grep_files, got {developer_texts:?}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("read_file")),
+        "expected sparse-context scaffold to mention read_file, got {developer_texts:?}"
+    );
+    assert!(
+        developer_texts.iter().any(|text| text.contains("list_dir")),
+        "expected sparse-context scaffold to mention list_dir, got {developer_texts:?}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("thread_synopsis")),
+        "expected sparse-context scaffold to mention seeded thread_synopsis, got {developer_texts:?}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("file_summaries")),
+        "expected sparse-context scaffold to mention seeded file_summaries, got {developer_texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn build_initial_context_omits_sparse_context_scaffold_by_default() {
+    let (session, turn_context) = make_session_and_context().await;
+
+    let initial_context = session.build_initial_context(&turn_context).await;
+    let developer_texts = developer_input_texts(&initial_context);
+
+    assert!(
+        !developer_texts
+            .iter()
+            .any(|text| text.contains("inspect on demand")),
+        "did not expect sparse-context scaffold by default, got {developer_texts:?}"
+    );
+}
+
+#[tokio::test]
 async fn build_initial_context_omits_default_image_save_location_with_image_history() {
     let (session, turn_context) = make_session_and_context().await;
     session

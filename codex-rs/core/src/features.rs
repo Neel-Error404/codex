@@ -110,6 +110,8 @@ pub enum Feature {
     WebSearchCached,
     /// Legacy search-tool feature flag kept for backward compatibility.
     SearchTool,
+    /// Bias the model toward inspect-on-demand behavior for large contexts.
+    SparseContext,
     /// Removed legacy Linux bubblewrap opt-in flag retained as a no-op so old
     /// wrappers and config can still parse it.
     UseLinuxSandboxBwrap,
@@ -594,6 +596,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::SearchTool,
         key: "search_tool",
         stage: Stage::Removed,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::SparseContext,
+        key: "sparse_context",
+        stage: Stage::Experimental {
+            name: "Sparse Context",
+            menu_description: "Bias Codex toward inspect-on-demand behavior for long threads and large repos. Pairs especially well with the JavaScript REPL scratchpad for recursive exploration while remaining disabled by default.",
+            announcement: "",
+        },
         default_enabled: false,
     },
     // Experimental program. Rendered in the `/experimental` menu for users.

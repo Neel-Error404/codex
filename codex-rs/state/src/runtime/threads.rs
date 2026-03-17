@@ -76,6 +76,25 @@ ORDER BY position ASC
         Ok(Some(tools))
     }
 
+    pub async fn get_thread_synopsis(&self, thread_id: ThreadId) -> anyhow::Result<Option<String>> {
+        let row = sqlx::query("SELECT synopsis FROM thread_synopsis WHERE thread_id = ?")
+            .bind(thread_id.to_string())
+            .fetch_optional(self.pool.as_ref())
+            .await?;
+        Ok(row.and_then(|row| row.try_get("synopsis").ok()))
+    }
+
+    pub async fn get_thread_sparse_context(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<Option<String>> {
+        let row = sqlx::query("SELECT payload FROM thread_sparse_context WHERE thread_id = ?")
+            .bind(thread_id.to_string())
+            .fetch_optional(self.pool.as_ref())
+            .await?;
+        Ok(row.and_then(|row| row.try_get("payload").ok()))
+    }
+
     /// Find a rollout path by thread id using the underlying database.
     pub async fn find_rollout_path_by_id(
         &self,
@@ -206,6 +225,48 @@ FROM threads
     pub async fn upsert_thread(&self, metadata: &crate::ThreadMetadata) -> anyhow::Result<()> {
         self.upsert_thread_with_creation_memory_mode(metadata, None)
             .await
+    }
+
+    pub async fn upsert_thread_synopsis(
+        &self,
+        thread_id: ThreadId,
+        synopsis: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+INSERT INTO thread_synopsis (thread_id, synopsis, updated_at)
+VALUES (?, ?, unixepoch())
+ON CONFLICT(thread_id) DO UPDATE SET
+    synopsis = excluded.synopsis,
+    updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(thread_id.to_string())
+        .bind(synopsis)
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_thread_sparse_context(
+        &self,
+        thread_id: ThreadId,
+        payload: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+INSERT INTO thread_sparse_context (thread_id, payload, updated_at)
+VALUES (?, ?, unixepoch())
+ON CONFLICT(thread_id) DO UPDATE SET
+    payload = excluded.payload,
+    updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(thread_id.to_string())
+        .bind(payload)
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(())
     }
 
     pub async fn insert_thread_if_absent(
@@ -702,6 +763,86 @@ mod tests {
                 .await
                 .expect("memory mode should remain readable");
         assert_eq!(memory_mode, "disabled");
+    }
+
+    #[tokio::test]
+    async fn upsert_thread_synopsis_persists_latest_value() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000124").expect("valid thread id");
+        let metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("initial upsert should succeed");
+
+        runtime
+            .upsert_thread_synopsis(thread_id, "first synopsis")
+            .await
+            .expect("first synopsis upsert should succeed");
+        assert_eq!(
+            runtime
+                .get_thread_synopsis(thread_id)
+                .await
+                .expect("synopsis should load"),
+            Some("first synopsis".to_string())
+        );
+
+        runtime
+            .upsert_thread_synopsis(thread_id, "updated synopsis")
+            .await
+            .expect("second synopsis upsert should succeed");
+        assert_eq!(
+            runtime
+                .get_thread_synopsis(thread_id)
+                .await
+                .expect("updated synopsis should load"),
+            Some("updated synopsis".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_thread_sparse_context_persists_latest_value() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000125").expect("valid thread id");
+        let metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("initial upsert should succeed");
+
+        runtime
+            .upsert_thread_sparse_context(thread_id, r#"{"facts":{"core_facts":"first"}}"#)
+            .await
+            .expect("first sparse context upsert should succeed");
+        assert_eq!(
+            runtime
+                .get_thread_sparse_context(thread_id)
+                .await
+                .expect("sparse context should load"),
+            Some(r#"{"facts":{"core_facts":"first"}}"#.to_string())
+        );
+
+        runtime
+            .upsert_thread_sparse_context(thread_id, r#"{"facts":{"core_facts":"updated"}}"#)
+            .await
+            .expect("second sparse context upsert should succeed");
+        assert_eq!(
+            runtime
+                .get_thread_sparse_context(thread_id)
+                .await
+                .expect("updated sparse context should load"),
+            Some(r#"{"facts":{"core_facts":"updated"}}"#.to_string())
+        );
     }
 
     #[tokio::test]

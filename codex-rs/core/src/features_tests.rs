@@ -86,6 +86,23 @@ fn guardian_approval_is_experimental_and_user_toggleable() {
 }
 
 #[test]
+fn sparse_context_is_experimental_and_user_toggleable() {
+    let spec = Feature::SparseContext.info();
+    let stage = spec.stage;
+
+    assert!(matches!(stage, Stage::Experimental { .. }));
+    assert_eq!(stage.experimental_menu_name(), Some("Sparse Context"));
+    assert_eq!(
+        stage.experimental_menu_description(),
+        Some(
+            "Bias Codex toward inspect-on-demand behavior for long threads and large repos. Pairs especially well with the JavaScript REPL scratchpad for recursive exploration while remaining disabled by default."
+        )
+    );
+    assert_eq!(stage.experimental_announcement(), None);
+    assert_eq!(Feature::SparseContext.default_enabled(), false);
+}
+
+#[test]
 fn request_permissions_is_under_development() {
     assert_eq!(
         Feature::ExecPermissionApprovals.stage(),

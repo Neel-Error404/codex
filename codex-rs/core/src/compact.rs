@@ -26,11 +26,87 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::user_input::UserInput;
 use futures::prelude::*;
+use serde::Deserialize;
+use serde::Serialize;
 use tracing::error;
 
 pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt.md");
 pub const SUMMARY_PREFIX: &str = include_str!("../templates/compact/summary_prefix.md");
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ThreadSynopsis {
+    pub core_facts: String,
+    #[serde(default)]
+    pub pending_steps: Vec<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+}
+
+impl ThreadSynopsis {
+    fn from_core_facts(core_facts: &str) -> Option<Self> {
+        let core_facts = core_facts.trim();
+        (!core_facts.is_empty()).then(|| Self {
+            core_facts: core_facts.to_string(),
+            pending_steps: Vec::new(),
+            constraints: Vec::new(),
+        })
+    }
+
+    pub(crate) fn from_persisted(raw: &str) -> Option<Self> {
+        serde_json::from_str::<Self>(raw)
+            .ok()
+            .and_then(Self::normalize)
+            .or_else(|| Self::from_core_facts(raw))
+    }
+
+    fn normalize(self) -> Option<Self> {
+        let core_facts = self.core_facts.trim().to_string();
+        let pending_steps = self
+            .pending_steps
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        let constraints = self
+            .constraints
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+
+        if core_facts.is_empty() && pending_steps.is_empty() && constraints.is_empty() {
+            None
+        } else {
+            Some(Self {
+                core_facts,
+                pending_steps,
+                constraints,
+            })
+        }
+    }
+
+    fn to_persisted_json(&self) -> Option<String> {
+        serde_json::to_string(self).ok()
+    }
+
+    pub(crate) fn render_for_prompt(&self) -> String {
+        let mut sections = Vec::new();
+        if !self.core_facts.is_empty() {
+            sections.push(format!("Core facts:\n{}", self.core_facts));
+        }
+        if !self.pending_steps.is_empty() {
+            sections.push(format!(
+                "Pending steps:\n- {}",
+                self.pending_steps.join("\n- ")
+            ));
+        }
+        if !self.constraints.is_empty() {
+            sections.push(format!("Constraints:\n- {}", self.constraints.join("\n- ")));
+        }
+        sections.join("\n")
+    }
+}
 
 /// Controls whether compaction replacement history must include initial context.
 ///
@@ -221,6 +297,15 @@ async fn run_compact_task_inner(
     sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
         .await;
     sess.recompute_token_usage(&turn_context).await;
+    if let Some(thread_synopsis) = thread_synopsis_from_summary_text(&summary_text) {
+        crate::state_db::persist_thread_synopsis(
+            sess.services.state_db.as_deref(),
+            sess.conversation_id,
+            &thread_synopsis,
+            "local_compact",
+        )
+        .await;
+    }
 
     sess.emit_turn_item_completed(&turn_context, compaction_item)
         .await;
@@ -268,6 +353,28 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<String> {
 
 pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
+}
+
+pub(crate) fn thread_synopsis_from_summary_text(summary_text: &str) -> Option<String> {
+    let normalized = summary_text
+        .strip_prefix(SUMMARY_PREFIX)
+        .map(|rest| rest.strip_prefix('\n').unwrap_or(rest))
+        .unwrap_or(summary_text)
+        .trim();
+    ThreadSynopsis::from_core_facts(normalized)?.to_persisted_json()
+}
+
+pub(crate) fn thread_synopsis_from_compacted_history(items: &[ResponseItem]) -> Option<String> {
+    items.iter().rev().find_map(|item| match item {
+        ResponseItem::Compaction { encrypted_content } => {
+            thread_synopsis_from_summary_text(encrypted_content)
+        }
+        ResponseItem::Message { role, content, .. } if role == "user" => {
+            let text = content_items_to_text(content)?;
+            is_summary_message(&text).then(|| thread_synopsis_from_summary_text(&text))?
+        }
+        _ => None,
+    })
 }
 
 /// Inserts canonical initial context into compacted replacement history at the

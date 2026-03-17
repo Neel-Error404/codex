@@ -94,3 +94,7 @@ argument-comment-lint *args:
 # Tail logs from the state SQLite database
 log *args:
     if [ "${1:-}" = "--" ]; then shift; fi; cargo run -p codex-state --bin logs_client -- "$@"
+
+# Run the branch-local validation harness for tool_search + sparse_context upgrades.
+agent-upgrades-check *args:
+    python ../scripts/agent_upgrade_check.py "$@"

@@ -7,6 +7,7 @@ use crate::codex::TurnContext;
 use crate::codex::built_tools;
 use crate::compact::InitialContextInjection;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
+use crate::compact::thread_synopsis_from_compacted_history;
 use crate::context_manager::ContextManager;
 use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
@@ -137,6 +138,7 @@ async fn run_remote_compact_task_inner_impl(
             Err(err)
         })
         .await?;
+    let thread_synopsis = thread_synopsis_from_compacted_history(&new_history);
     new_history = process_compacted_history(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -159,6 +161,15 @@ async fn run_remote_compact_task_inner_impl(
     sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
         .await;
     sess.recompute_token_usage(turn_context).await;
+    if let Some(thread_synopsis) = thread_synopsis {
+        crate::state_db::persist_thread_synopsis(
+            sess.services.state_db.as_deref(),
+            sess.conversation_id,
+            &thread_synopsis,
+            "remote_compact",
+        )
+        .await;
+    }
 
     sess.emit_turn_item_completed(turn_context, compaction_item)
         .await;

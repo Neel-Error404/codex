@@ -6,6 +6,9 @@ use crate::protocol::AskForApproval;
 use crate::protocol::EventMsg;
 use crate::protocol::SandboxPolicy;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use codex_otel::SessionTelemetry;
+use codex_otel::metrics::MetricsClient;
+use codex_otel::metrics::MetricsConfig;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -14,7 +17,14 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::InputModality;
+use opentelemetry::KeyValue;
+use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+use opentelemetry_sdk::metrics::data::Metric;
+use opentelemetry_sdk::metrics::data::MetricData;
+use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
@@ -27,6 +37,89 @@ fn set_danger_full_access(turn: &mut crate::codex::TurnContext) {
         crate::protocol::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
     turn.network_sandbox_policy =
         crate::protocol::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
+}
+
+fn test_session_telemetry() -> SessionTelemetry {
+    let exporter = InMemoryMetricExporter::default();
+    let metrics = MetricsClient::new(
+        MetricsConfig::in_memory("test", "codex-core", env!("CARGO_PKG_VERSION"), exporter)
+            .with_runtime_reader(),
+    )
+    .expect("in-memory metrics client");
+    SessionTelemetry::new(
+        ThreadId::new(),
+        "gpt-5.1",
+        "gpt-5.1",
+        None,
+        None,
+        None,
+        "test_originator".to_string(),
+        false,
+        "tty".to_string(),
+        codex_protocol::protocol::SessionSource::Cli,
+    )
+    .with_metrics_without_metadata_tags(metrics)
+}
+
+fn find_metric<'a>(resource_metrics: &'a ResourceMetrics, name: &str) -> &'a Metric {
+    for scope_metrics in resource_metrics.scope_metrics() {
+        for metric in scope_metrics.metrics() {
+            if metric.name() == name {
+                return metric;
+            }
+        }
+    }
+    panic!("metric {name} missing");
+}
+
+fn attributes_to_map<'a>(
+    attributes: impl Iterator<Item = &'a KeyValue>,
+) -> BTreeMap<String, String> {
+    attributes
+        .map(|kv| (kv.key.as_str().to_string(), kv.value.as_str().to_string()))
+        .collect()
+}
+
+fn counter_points(
+    resource_metrics: &ResourceMetrics,
+    name: &str,
+) -> Vec<(BTreeMap<String, String>, u64)> {
+    let metric = find_metric(resource_metrics, name);
+    let mut points = match metric.data() {
+        AggregatedMetrics::U64(data) => match data {
+            MetricData::Sum(sum) => sum
+                .data_points()
+                .map(|point| (attributes_to_map(point.attributes()), point.value()))
+                .collect::<Vec<_>>(),
+            _ => panic!("unexpected counter aggregation"),
+        },
+        _ => panic!("unexpected counter data type"),
+    };
+    points.sort_by(|(left_attrs, _), (right_attrs, _)| left_attrs.cmp(right_attrs));
+    points
+}
+
+fn histogram_summary(
+    resource_metrics: &ResourceMetrics,
+    name: &str,
+) -> (BTreeMap<String, String>, f64, u64) {
+    let metric = find_metric(resource_metrics, name);
+    match metric.data() {
+        AggregatedMetrics::F64(data) => match data {
+            MetricData::Histogram(histogram) => {
+                let points: Vec<_> = histogram.data_points().collect();
+                assert_eq!(points.len(), 1);
+                let point = points[0];
+                (
+                    attributes_to_map(point.attributes()),
+                    point.sum(),
+                    point.count(),
+                )
+            }
+            _ => panic!("unexpected histogram aggregation"),
+        },
+        _ => panic!("unexpected histogram data type"),
+    }
 }
 
 #[test]
@@ -158,6 +251,465 @@ fn js_repl_internal_tool_guard_matches_expected_names() {
     assert!(is_js_repl_internal_tool("js_repl_reset"));
     assert!(!is_js_repl_internal_tool("shell_command"));
     assert!(!is_js_repl_internal_tool("list_mcp_resources"));
+}
+
+#[test]
+fn build_sparse_context_seed_payload_includes_structured_synopsis_and_scratch_defaults() {
+    let payload = build_sparse_context_seed_payload(Some(&crate::compact::ThreadSynopsis {
+        core_facts: "User wants low-cost, high-accuracy behavior.".to_string(),
+        pending_steps: vec!["Implement tool search".to_string()],
+        constraints: vec!["Prefer targeted reads".to_string()],
+    }));
+
+    assert_eq!(payload.thread_synopsis.as_ref(), Some(&payload.facts));
+    assert_eq!(
+        payload.facts.core_facts,
+        "User wants low-cost, high-accuracy behavior."
+    );
+    assert_eq!(
+        payload.facts.pending_steps,
+        vec!["Implement tool search".to_string()]
+    );
+    assert_eq!(
+        payload.facts.constraints,
+        vec!["Prefer targeted reads".to_string()]
+    );
+    assert!(payload.file_summaries.is_empty());
+    assert!(payload.open_questions.is_empty());
+}
+
+#[test]
+fn build_sparse_context_seed_payload_handles_missing_synopsis() {
+    let payload = build_sparse_context_seed_payload(None);
+
+    assert!(payload.thread_synopsis.is_none());
+    assert_eq!(payload.facts.core_facts, "");
+    assert!(payload.facts.pending_steps.is_empty());
+    assert!(payload.facts.constraints.is_empty());
+    assert!(payload.file_summaries.is_empty());
+    assert!(payload.open_questions.is_empty());
+}
+
+#[test]
+fn normalize_sparse_context_payload_promotes_latest_facts_into_thread_synopsis() {
+    let payload = normalize_sparse_context_payload_for_host(SparseContextPayload {
+        thread_synopsis: Some(crate::compact::ThreadSynopsis {
+            core_facts: "Stale facts".to_string(),
+            pending_steps: vec!["Old step".to_string()],
+            constraints: vec![],
+        }),
+        facts: crate::compact::ThreadSynopsis {
+            core_facts: "Fresh facts".to_string(),
+            pending_steps: vec!["New step".to_string()],
+            constraints: vec!["Stay targeted".to_string()],
+        },
+        file_summaries: BTreeMap::from([("src/main.rs".to_string(), "Entry point".to_string())]),
+        open_questions: vec!["What still needs verification?".to_string()],
+    });
+
+    assert_eq!(
+        payload.thread_synopsis,
+        Some(crate::compact::ThreadSynopsis {
+            core_facts: "Fresh facts".to_string(),
+            pending_steps: vec!["New step".to_string()],
+            constraints: vec!["Stay targeted".to_string()],
+        })
+    );
+    assert_eq!(
+        sparse_context_payload_synopsis_json(&payload),
+        Some(
+            r#"{"core_facts":"Fresh facts","pending_steps":["New step"],"constraints":["Stay targeted"]}"#
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn normalize_sparse_context_payload_keeps_non_synopsis_state_when_facts_are_empty() {
+    let payload = normalize_sparse_context_payload_for_host(SparseContextPayload {
+        thread_synopsis: None,
+        facts: crate::compact::ThreadSynopsis {
+            core_facts: String::new(),
+            pending_steps: Vec::new(),
+            constraints: Vec::new(),
+        },
+        file_summaries: BTreeMap::from([("src/lib.rs".to_string(), "Library".to_string())]),
+        open_questions: vec!["Need follow-up".to_string()],
+    });
+
+    assert!(payload.thread_synopsis.is_none());
+    assert_eq!(sparse_context_payload_synopsis_json(&payload), None);
+    assert_eq!(
+        payload.file_summaries.get("src/lib.rs").map(String::as_str),
+        Some("Library")
+    );
+    assert_eq!(payload.open_questions, vec!["Need follow-up".to_string()]);
+}
+
+#[test]
+fn normalize_sparse_context_payload_bounds_file_summaries() {
+    let payload = normalize_sparse_context_payload_for_host(SparseContextPayload {
+        thread_synopsis: Some(crate::compact::ThreadSynopsis {
+            core_facts: "Facts".to_string(),
+            pending_steps: Vec::new(),
+            constraints: Vec::new(),
+        }),
+        facts: crate::compact::ThreadSynopsis {
+            core_facts: "Facts".to_string(),
+            pending_steps: Vec::new(),
+            constraints: Vec::new(),
+        },
+        file_summaries: (0..(SPARSE_CONTEXT_FILE_SUMMARIES_MAX_ENTRIES + 8))
+            .map(|idx| {
+                (
+                    format!("src/{idx}.rs"),
+                    format!("{} summary {}", "x".repeat(4_096), idx),
+                )
+            })
+            .collect(),
+        open_questions: Vec::new(),
+    });
+
+    assert!(payload.file_summaries.len() <= SPARSE_CONTEXT_FILE_SUMMARIES_MAX_ENTRIES);
+    assert!(
+        payload
+            .file_summaries
+            .values()
+            .all(|summary| { summary.len() <= SPARSE_CONTEXT_FILE_SUMMARY_MAX_BYTES })
+    );
+    let total_bytes: usize = payload
+        .file_summaries
+        .iter()
+        .map(|(path, summary)| path.len() + summary.len())
+        .sum();
+    assert!(total_bytes <= SPARSE_CONTEXT_FILE_SUMMARIES_TOTAL_MAX_BYTES);
+}
+
+#[test]
+fn normalize_sparse_context_payload_reports_truncation_stats() {
+    let long_path = format!("src/{}", "nested/".repeat(80));
+    let long_summary = "s".repeat(SPARSE_CONTEXT_FILE_SUMMARY_MAX_BYTES + 512);
+    let (payload, stats) =
+        normalize_sparse_context_payload_for_host_with_stats(SparseContextPayload {
+            thread_synopsis: Some(crate::compact::ThreadSynopsis {
+                core_facts: "Facts".to_string(),
+                pending_steps: Vec::new(),
+                constraints: Vec::new(),
+            }),
+            facts: crate::compact::ThreadSynopsis {
+                core_facts: "Facts".to_string(),
+                pending_steps: Vec::new(),
+                constraints: Vec::new(),
+            },
+            file_summaries: BTreeMap::from([
+                (long_path, long_summary),
+                ("src/keep.rs".to_string(), "Keep".to_string()),
+            ]),
+            open_questions: Vec::new(),
+        });
+
+    assert!(stats.truncated_path_count > 0);
+    assert!(stats.truncated_summary_count > 0);
+    assert!(stats.file_summaries_truncated());
+    let first = payload
+        .file_summaries
+        .first_key_value()
+        .expect("file summary should be preserved after normalization");
+    assert!(first.0.len() <= SPARSE_CONTEXT_FILE_SUMMARY_PATH_MAX_BYTES);
+    assert!(first.1.len() <= SPARSE_CONTEXT_FILE_SUMMARY_MAX_BYTES);
+}
+
+#[test]
+fn resolve_sparse_context_seed_payload_falls_back_to_synopsis_for_invalid_persisted_blob() {
+    let synopsis = crate::compact::ThreadSynopsis {
+        core_facts: "Fresh synopsis".to_string(),
+        pending_steps: vec!["Step A".to_string()],
+        constraints: vec!["Stay targeted".to_string()],
+    };
+
+    let resolution =
+        resolve_sparse_context_seed_payload(Some(&synopsis), None, Some("{not valid json"));
+
+    assert_eq!(resolution.source, SparseContextSeedSource::SynopsisOnly);
+    assert!(resolution.persisted_blob_parse_failed);
+    assert_eq!(resolution.payload.thread_synopsis, Some(synopsis.clone()));
+    assert_eq!(resolution.payload.facts, synopsis);
+}
+
+#[test]
+fn emit_sparse_context_seed_metrics_records_source_and_parse_failure() {
+    let session_telemetry = test_session_telemetry();
+    let resolution = resolve_sparse_context_seed_payload(
+        Some(&crate::compact::ThreadSynopsis {
+            core_facts: "Facts".to_string(),
+            pending_steps: vec!["Step".to_string()],
+            constraints: Vec::new(),
+        }),
+        None,
+        Some("{invalid"),
+    );
+
+    emit_sparse_context_seed_metrics(&session_telemetry, &resolution);
+
+    let snapshot = session_telemetry
+        .snapshot_metrics()
+        .expect("runtime metrics snapshot");
+    assert_eq!(
+        counter_points(&snapshot, JS_REPL_SPARSE_CONTEXT_SEED_METRIC),
+        vec![(
+            BTreeMap::from([("source".to_string(), "synopsis_only".to_string(),)]),
+            1,
+        )]
+    );
+    assert_eq!(
+        counter_points(&snapshot, JS_REPL_SPARSE_CONTEXT_SEED_PARSE_FAILURE_METRIC,),
+        vec![(
+            BTreeMap::from([("source".to_string(), "state_db_blob".to_string(),)]),
+            1,
+        )]
+    );
+}
+
+#[test]
+fn merge_sparse_context_payload_with_synopsis_replaces_stale_facts_and_keeps_workspace_state() {
+    let payload = merge_sparse_context_payload_with_synopsis(
+        SparseContextPayload {
+            thread_synopsis: Some(crate::compact::ThreadSynopsis {
+                core_facts: "Old facts".to_string(),
+                pending_steps: vec!["Old step".to_string()],
+                constraints: vec![],
+            }),
+            facts: crate::compact::ThreadSynopsis {
+                core_facts: "Old facts".to_string(),
+                pending_steps: vec!["Old step".to_string()],
+                constraints: vec![],
+            },
+            file_summaries: BTreeMap::from([("src/a.rs".to_string(), "A".to_string())]),
+            open_questions: vec!["Keep this".to_string()],
+        },
+        Some(&crate::compact::ThreadSynopsis {
+            core_facts: "New facts".to_string(),
+            pending_steps: vec!["New step".to_string()],
+            constraints: vec!["Stay precise".to_string()],
+        }),
+    );
+
+    assert_eq!(
+        payload.thread_synopsis,
+        Some(crate::compact::ThreadSynopsis {
+            core_facts: "New facts".to_string(),
+            pending_steps: vec!["New step".to_string()],
+            constraints: vec!["Stay precise".to_string()],
+        })
+    );
+    assert_eq!(
+        payload.facts,
+        crate::compact::ThreadSynopsis {
+            core_facts: "New facts".to_string(),
+            pending_steps: vec!["New step".to_string()],
+            constraints: vec!["Stay precise".to_string()],
+        }
+    );
+    assert_eq!(
+        payload.file_summaries.get("src/a.rs").map(String::as_str),
+        Some("A")
+    );
+    assert_eq!(payload.open_questions, vec!["Keep this".to_string()]);
+}
+
+#[test]
+fn kernel_source_handles_sparse_context_sync_messages() {
+    assert!(KERNEL_SOURCE.contains("sync_sparse_context"));
+    assert!(KERNEL_SOURCE.contains("sparse_context_result"));
+    assert!(KERNEL_SOURCE.contains("thread_synopsis"));
+    assert!(KERNEL_SOURCE.contains("file_summaries"));
+    assert!(KERNEL_SOURCE.contains("open_questions"));
+    assert!(KERNEL_SOURCE.contains("sparse_context: getSparseContextSnapshot()"));
+    assert!(KERNEL_SOURCE.contains("context.thread_synopsis"));
+    assert!(KERNEL_SOURCE.contains("context.file_summaries"));
+    assert!(KERNEL_SOURCE.contains("context.open_questions"));
+}
+
+#[tokio::test]
+async fn persist_sparse_context_payload_updates_state_db_and_manager_cache() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let sqlite_home = tempfile::tempdir().expect("create sqlite tempdir");
+    let state_db = codex_state::StateRuntime::init(
+        sqlite_home.path().to_path_buf(),
+        "test-provider".to_string(),
+    )
+    .await
+    .expect("state db should initialize");
+
+    let mut metadata = codex_state::ThreadMetadataBuilder::new(
+        session.conversation_id,
+        sqlite_home.path().join("rollout.jsonl"),
+        chrono::Utc::now(),
+        codex_protocol::protocol::SessionSource::Exec,
+    )
+    .build("test-provider");
+    metadata.cwd = turn_context.cwd.clone();
+    state_db
+        .upsert_thread(&metadata)
+        .await
+        .expect("thread metadata should persist");
+    session.services.state_db = Some(state_db);
+
+    let manager = JsReplManager::new(None, Vec::new())
+        .await
+        .expect("manager should initialize");
+    manager
+        .persist_sparse_context_payload(
+            &session,
+            SparseContextPayload {
+                thread_synopsis: None,
+                facts: crate::compact::ThreadSynopsis {
+                    core_facts: "Fresh facts".to_string(),
+                    pending_steps: vec!["Next step".to_string()],
+                    constraints: vec!["Stay targeted".to_string()],
+                },
+                file_summaries: BTreeMap::from([(
+                    "src/lib.rs".to_string(),
+                    "Library entry".to_string(),
+                )]),
+                open_questions: vec!["What is missing?".to_string()],
+            },
+        )
+        .await;
+
+    let stored_synopsis = session
+        .services
+        .state_db
+        .as_ref()
+        .expect("state db should be attached")
+        .get_thread_synopsis(session.conversation_id)
+        .await
+        .expect("state db read should succeed");
+    assert_eq!(
+        stored_synopsis,
+        Some(
+            r#"{"core_facts":"Fresh facts","pending_steps":["Next step"],"constraints":["Stay targeted"]}"#
+                .to_string()
+        )
+    );
+
+    let cached_payload = manager.persistent_sparse_context.lock().await.clone();
+    assert_eq!(
+        cached_payload,
+        Some(SparseContextPayload {
+            thread_synopsis: Some(crate::compact::ThreadSynopsis {
+                core_facts: "Fresh facts".to_string(),
+                pending_steps: vec!["Next step".to_string()],
+                constraints: vec!["Stay targeted".to_string()],
+            }),
+            facts: crate::compact::ThreadSynopsis {
+                core_facts: "Fresh facts".to_string(),
+                pending_steps: vec!["Next step".to_string()],
+                constraints: vec!["Stay targeted".to_string()],
+            },
+            file_summaries: BTreeMap::from([(
+                "src/lib.rs".to_string(),
+                "Library entry".to_string(),
+            )]),
+            open_questions: vec!["What is missing?".to_string()],
+        })
+    );
+}
+
+#[tokio::test]
+async fn persist_sparse_context_payload_records_truncation_and_payload_metrics() {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    session.services.session_telemetry = test_session_telemetry();
+
+    let manager = JsReplManager::new(None, Vec::new())
+        .await
+        .expect("manager should initialize");
+    manager
+        .persist_sparse_context_payload(
+            &session,
+            SparseContextPayload {
+                thread_synopsis: None,
+                facts: crate::compact::ThreadSynopsis {
+                    core_facts: "Fresh facts".to_string(),
+                    pending_steps: vec!["Next step".to_string()],
+                    constraints: vec!["Stay targeted".to_string()],
+                },
+                file_summaries: BTreeMap::from([(
+                    format!("src/{}", "deep/".repeat(100)),
+                    "x".repeat(SPARSE_CONTEXT_FILE_SUMMARY_MAX_BYTES + 256),
+                )]),
+                open_questions: vec!["What is missing?".to_string()],
+            },
+        )
+        .await;
+
+    let snapshot = session
+        .services
+        .session_telemetry
+        .snapshot_metrics()
+        .expect("runtime metrics snapshot");
+    assert_eq!(
+        counter_points(
+            &snapshot,
+            JS_REPL_SPARSE_CONTEXT_FILE_SUMMARY_TRUNCATION_METRIC,
+        ),
+        vec![
+            (
+                BTreeMap::from([("reason".to_string(), "path_bytes".to_string())]),
+                1,
+            ),
+            (
+                BTreeMap::from([("reason".to_string(), "summary_bytes".to_string())]),
+                1,
+            ),
+        ]
+    );
+    let (attrs, sum, count) = histogram_summary(
+        &snapshot,
+        JS_REPL_SPARSE_CONTEXT_PERSIST_PAYLOAD_BYTES_METRIC,
+    );
+    assert_eq!(attrs, BTreeMap::new());
+    assert_eq!(count, 1);
+    assert!(sum > 0.0);
+}
+
+#[tokio::test]
+async fn persistent_sparse_context_round_trips_through_state_db() {
+    let sqlite_home = tempfile::tempdir().expect("create sqlite tempdir");
+    let state_db = codex_state::StateRuntime::init(
+        sqlite_home.path().to_path_buf(),
+        "test-provider".to_string(),
+    )
+    .await
+    .expect("state db should initialize");
+    let thread_id = ThreadId::default();
+    let metadata = codex_state::ThreadMetadataBuilder::new(
+        thread_id,
+        sqlite_home.path().join("rollout.jsonl"),
+        chrono::Utc::now(),
+        codex_protocol::protocol::SessionSource::Exec,
+    )
+    .build("test-provider");
+    state_db
+        .upsert_thread(&metadata)
+        .await
+        .expect("thread metadata should persist");
+
+    state_db
+        .upsert_thread_sparse_context(
+            thread_id,
+            r#"{"thread_synopsis":{"core_facts":"Cached facts","pending_steps":["Step A"],"constraints":["Stay lean"]},"facts":{"core_facts":"Cached facts","pending_steps":["Step A"],"constraints":["Stay lean"]},"file_summaries":{"src/lib.rs":"Summary"},"open_questions":["Question"]}"#,
+        )
+        .await
+        .expect("thread sparse context should persist");
+
+    assert_eq!(
+        state_db
+            .get_thread_sparse_context(thread_id)
+            .await
+            .expect("thread sparse context should load"),
+        Some(r#"{"thread_synopsis":{"core_facts":"Cached facts","pending_steps":["Step A"],"constraints":["Stay lean"]},"facts":{"core_facts":"Cached facts","pending_steps":["Step A"],"constraints":["Stay lean"]},"file_summaries":{"src/lib.rs":"Summary"},"open_questions":["Question"]}"#.to_string())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -491,6 +1043,10 @@ async fn can_run_js_repl_runtime_tests() -> bool {
     // integration tests instead.
     cfg!(target_os = "macos")
 }
+
+async fn can_run_js_repl_sparse_context_runtime_tests() -> bool {
+    cfg!(target_os = "windows") || can_run_js_repl_runtime_tests().await
+}
 fn write_js_repl_test_package_source(base: &Path, name: &str, source: &str) -> anyhow::Result<()> {
     let pkg_dir = base.join("node_modules").join(name);
     fs::create_dir_all(&pkg_dir)?;
@@ -515,6 +1071,124 @@ fn write_js_repl_test_module(base: &Path, relative: &str, contents: &str) -> any
         fs::create_dir_all(parent)?;
     }
     fs::write(module_path, contents)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn js_repl_sparse_context_persists_across_reset_via_state_db() -> anyhow::Result<()> {
+    if !can_run_js_repl_sparse_context_runtime_tests().await {
+        return Ok(());
+    }
+
+    let sqlite_home = tempfile::tempdir()?;
+    let (mut session, mut turn) = make_session_and_context().await;
+    Arc::make_mut(&mut turn.config)
+        .features
+        .enable(Feature::SparseContext)
+        .expect("test config should allow sparse-context feature update");
+    turn.features
+        .enable(Feature::SparseContext)
+        .expect("test turn features should allow sparse-context feature update");
+
+    let state_db = codex_state::StateRuntime::init(
+        sqlite_home.path().to_path_buf(),
+        "test-provider".to_string(),
+    )
+    .await?;
+    let mut metadata = codex_state::ThreadMetadataBuilder::new(
+        session.conversation_id,
+        sqlite_home.path().join("rollout.jsonl"),
+        chrono::Utc::now(),
+        codex_protocol::protocol::SessionSource::Exec,
+    )
+    .build("test-provider");
+    metadata.cwd = turn.cwd.clone();
+    state_db.upsert_thread(&metadata).await?;
+    session.services.state_db = Some(state_db);
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::default()));
+    let manager = turn.js_repl.manager().await?;
+
+    manager
+        .execute(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            Arc::clone(&tracker),
+            JsReplArgs {
+                code: r#"
+globalThis.facts = {
+  core_facts: "Fresh runtime facts",
+  pending_steps: ["Rehydrate after reset"],
+  constraints: ["Stay sparse"],
+};
+globalThis.thread_synopsis = Object.freeze(globalThis.facts);
+globalThis.file_summaries = globalThis.file_summaries ?? {};
+globalThis.file_summaries["src/runtime.rs"] = "Runtime summary";
+globalThis.open_questions = ["What remains?"];
+console.log("seeded");
+"#
+                .to_string(),
+                timeout_ms: Some(10_000),
+            },
+        )
+        .await?;
+
+    let persisted_payload = session
+        .services
+        .state_db
+        .as_ref()
+        .expect("state db should be attached")
+        .get_thread_sparse_context(session.conversation_id)
+        .await?;
+    assert!(
+        persisted_payload
+            .as_deref()
+            .is_some_and(|payload| payload.contains("src/runtime.rs")),
+        "persisted sparse context missing expected file summary: {persisted_payload:?}"
+    );
+
+    manager.reset().await?;
+    manager.persistent_sparse_context.lock().await.take();
+
+    let result = manager
+        .execute(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            tracker,
+            JsReplArgs {
+                code: r#"
+console.log(JSON.stringify({
+  facts: globalThis.facts,
+  thread_synopsis: globalThis.thread_synopsis,
+  file_summaries: globalThis.file_summaries,
+  open_questions: globalThis.open_questions,
+}));
+"#
+                .to_string(),
+                timeout_ms: Some(10_000),
+            },
+        )
+        .await?;
+
+    let restored: serde_json::Value = serde_json::from_str(result.output.trim())?;
+    assert_eq!(
+        restored["facts"]["core_facts"].as_str(),
+        Some("Fresh runtime facts")
+    );
+    assert_eq!(
+        restored["file_summaries"]["src/runtime.rs"].as_str(),
+        Some("Runtime summary")
+    );
+    assert_eq!(
+        restored["open_questions"][0].as_str(),
+        Some("What remains?")
+    );
+    assert_eq!(
+        restored["thread_synopsis"]["pending_steps"][0].as_str(),
+        Some("Rehydrate after reset")
+    );
     Ok(())
 }
 

@@ -9,9 +9,9 @@ use std::sync::Arc;
 #[test]
 fn serialize_tool_search_output_tools_groups_results_by_namespace() {
     let entries = [
-        (
-            "mcp__codex_apps__calendar_create_event".to_string(),
-            ToolInfo {
+        SearchableTool::App {
+            name: "mcp__codex_apps__calendar_create_event".to_string(),
+            info: ToolInfo {
                 server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
                 tool_name: "_create_event".to_string(),
                 tool_namespace: "mcp__codex_apps__calendar".to_string(),
@@ -34,10 +34,10 @@ fn serialize_tool_search_output_tools_groups_results_by_namespace() {
                 plugin_display_names: Vec::new(),
                 connector_description: Some("Plan events".to_string()),
             },
-        ),
-        (
-            "mcp__codex_apps__gmail_read_email".to_string(),
-            ToolInfo {
+        },
+        SearchableTool::App {
+            name: "mcp__codex_apps__gmail_read_email".to_string(),
+            info: ToolInfo {
                 server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
                 tool_name: "_read_email".to_string(),
                 tool_namespace: "mcp__codex_apps__gmail".to_string(),
@@ -60,10 +60,10 @@ fn serialize_tool_search_output_tools_groups_results_by_namespace() {
                 plugin_display_names: Vec::new(),
                 connector_description: Some("Read mail".to_string()),
             },
-        ),
-        (
-            "mcp__codex_apps__calendar_list_events".to_string(),
-            ToolInfo {
+        },
+        SearchableTool::App {
+            name: "mcp__codex_apps__calendar_list_events".to_string(),
+            info: ToolInfo {
                 server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
                 tool_name: "_list_events".to_string(),
                 tool_namespace: "mcp__codex_apps__calendar".to_string(),
@@ -86,11 +86,10 @@ fn serialize_tool_search_output_tools_groups_results_by_namespace() {
                 plugin_display_names: Vec::new(),
                 connector_description: Some("Plan events".to_string()),
             },
-        ),
+        },
     ];
 
-    let tools = serialize_tool_search_output_tools(&[&entries[0], &entries[1], &entries[2]])
-        .expect("serialize tool search output");
+    let tools = serialize_tool_search_output_tools(&entries).expect("serialize tool search output");
 
     assert_eq!(
         tools,
@@ -147,9 +146,9 @@ fn serialize_tool_search_output_tools_groups_results_by_namespace() {
 
 #[test]
 fn serialize_tool_search_output_tools_falls_back_to_connector_name_description() {
-    let entries = [(
-        "mcp__codex_apps__gmail_batch_read_email".to_string(),
-        ToolInfo {
+    let entries = [SearchableTool::App {
+        name: "mcp__codex_apps__gmail_batch_read_email".to_string(),
+        info: ToolInfo {
             server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
             tool_name: "_batch_read_email".to_string(),
             tool_namespace: "mcp__codex_apps__gmail".to_string(),
@@ -172,9 +171,9 @@ fn serialize_tool_search_output_tools_falls_back_to_connector_name_description()
             plugin_display_names: Vec::new(),
             connector_description: None,
         },
-    )];
+    }];
 
-    let tools = serialize_tool_search_output_tools(&[&entries[0]]).expect("serialize");
+    let tools = serialize_tool_search_output_tools(&entries).expect("serialize");
 
     assert_eq!(
         tools,
@@ -193,6 +192,46 @@ fn serialize_tool_search_output_tools_falls_back_to_connector_name_description()
                 },
                 output_schema: None,
             })],
+        })]
+    );
+}
+
+#[test]
+fn serialize_tool_search_output_tools_includes_deferred_dynamic_functions() {
+    let entries = [SearchableTool::Dynamic(
+        codex_protocol::dynamic_tools::DynamicToolSpec {
+            name: "hidden_dynamic_tool".to_string(),
+            description: "A hidden dynamic tool.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": { "type": "string" }
+                },
+                "required": ["city"],
+                "additionalProperties": false
+            }),
+            defer_loading: true,
+        },
+    )];
+
+    let tools = serialize_tool_search_output_tools(&entries).expect("serialize");
+
+    assert_eq!(
+        tools,
+        vec![ToolSearchOutputTool::Function(ResponsesApiTool {
+            name: "hidden_dynamic_tool".to_string(),
+            description: "A hidden dynamic tool.".to_string(),
+            strict: false,
+            defer_loading: Some(true),
+            parameters: crate::tools::spec::JsonSchema::Object {
+                properties: std::collections::BTreeMap::from([(
+                    "city".to_string(),
+                    crate::tools::spec::JsonSchema::String { description: None },
+                )]),
+                required: Some(vec!["city".to_string()]),
+                additional_properties: Some(false.into()),
+            },
+            output_schema: None,
         })]
     );
 }

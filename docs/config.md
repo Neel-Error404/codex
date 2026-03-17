@@ -57,6 +57,40 @@ Codex stores the SQLite-backed state DB under `sqlite_home` (config key) or the
 `CODEX_SQLITE_HOME` environment variable. When unset, WorkspaceWrite sandbox
 sessions default to a temp directory; other modes default to `CODEX_HOME`.
 
+The SQLite state DB is also where this branch persists:
+
+- structured thread synopses derived from compaction
+- sparse-context payloads used by the `js_repl` recursive inspection scaffold
+
+## Experimental Long-Thread Features
+
+This branch adds several experimental long-thread features that work together
+for tool-heavy and long-running sessions.
+
+You can enable them either in `config.toml` or from the `/experimental` menu.
+`sparse_context` remains disabled by default even when exposed in
+`/experimental`.
+
+```toml
+[features]
+js_repl = true
+sparse_context = true
+```
+
+Notes:
+
+- `js_repl` enables the persistent Node-backed JavaScript scratchpad.
+- `sparse_context` biases the runtime toward inspect-on-demand behavior and
+  uses `js_repl` as the recursive working memory layer when available.
+- `js_repl_tools_only` can be enabled if you want direct model-visible tool
+  access restricted to `js_repl` / `js_repl_reset`.
+- deferred tool discovery is exposed via the built-in `tool_search` tool when
+  deferred app tools or deferred dynamic tools are present; there is no
+  separate user-facing config knob for this path.
+
+For the implementation status and exact scope of these features, see
+[`docs/plans/2026-03-17-gpt54-agent-upgrades.md`](./plans/2026-03-17-gpt54-agent-upgrades.md).
+
 ## Custom CA Certificates
 
 Codex can trust a custom root CA bundle for outbound HTTPS and secure websocket

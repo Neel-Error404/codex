@@ -185,6 +185,40 @@ fn build_token_limited_compacted_history_appends_summary_message() {
     assert_eq!(summary, summary_text);
 }
 
+#[test]
+fn thread_synopsis_from_summary_text_strips_compaction_prefix() {
+    let synopsis = thread_synopsis_from_summary_text(&format!(
+        "{SUMMARY_PREFIX}\nuser prefers low-cost, high-accuracy runs"
+    ));
+
+    let synopsis = synopsis.expect("expected synopsis");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&synopsis).expect("valid synopsis json"),
+        serde_json::json!({
+            "core_facts": "user prefers low-cost, high-accuracy runs",
+            "pending_steps": [],
+            "constraints": [],
+        })
+    );
+}
+
+#[test]
+fn thread_synopsis_from_compacted_history_reads_compaction_items() {
+    let synopsis = thread_synopsis_from_compacted_history(&[ResponseItem::Compaction {
+        encrypted_content: format!("{SUMMARY_PREFIX}\ncarry forward this summary"),
+    }]);
+
+    let synopsis = synopsis.expect("expected synopsis");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&synopsis).expect("valid synopsis json"),
+        serde_json::json!({
+            "core_facts": "carry forward this summary",
+            "pending_steps": [],
+            "constraints": [],
+        })
+    );
+}
+
 #[tokio::test]
 async fn process_compacted_history_replaces_developer_messages() {
     let compacted_history = vec![

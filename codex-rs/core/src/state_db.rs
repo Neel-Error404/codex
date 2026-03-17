@@ -300,6 +300,48 @@ pub async fn get_dynamic_tools(
     }
 }
 
+pub async fn get_thread_synopsis(
+    context: Option<&codex_state::StateRuntime>,
+    thread_id: ThreadId,
+    stage: &str,
+) -> Option<String> {
+    get_thread_synopsis_structured(context, thread_id, stage)
+        .await
+        .map(|synopsis| synopsis.render_for_prompt())
+}
+
+pub(crate) async fn get_thread_synopsis_structured(
+    context: Option<&codex_state::StateRuntime>,
+    thread_id: ThreadId,
+    stage: &str,
+) -> Option<crate::compact::ThreadSynopsis> {
+    let ctx = context?;
+    match ctx.get_thread_synopsis(thread_id).await {
+        Ok(synopsis) => {
+            synopsis.and_then(|raw| crate::compact::ThreadSynopsis::from_persisted(&raw))
+        }
+        Err(err) => {
+            warn!("state db get_thread_synopsis failed during {stage}: {err}");
+            None
+        }
+    }
+}
+
+pub(crate) async fn get_thread_sparse_context(
+    context: Option<&codex_state::StateRuntime>,
+    thread_id: ThreadId,
+    stage: &str,
+) -> Option<String> {
+    let ctx = context?;
+    match ctx.get_thread_sparse_context(thread_id).await {
+        Ok(payload) => payload.filter(|payload| !payload.trim().is_empty()),
+        Err(err) => {
+            warn!("state db get_thread_sparse_context failed during {stage}: {err}");
+            None
+        }
+    }
+}
+
 /// Persist dynamic tools for a thread id using SQLite, if none exist yet.
 pub async fn persist_dynamic_tools(
     context: Option<&codex_state::StateRuntime>,
@@ -312,6 +354,37 @@ pub async fn persist_dynamic_tools(
     };
     if let Err(err) = ctx.persist_dynamic_tools(thread_id, tools).await {
         warn!("state db persist_dynamic_tools failed during {stage}: {err}");
+    }
+}
+
+pub async fn persist_thread_synopsis(
+    context: Option<&codex_state::StateRuntime>,
+    thread_id: ThreadId,
+    synopsis: &str,
+    stage: &str,
+) {
+    let Some(ctx) = context else {
+        return;
+    };
+    if synopsis.trim().is_empty() {
+        return;
+    }
+    if let Err(err) = ctx.upsert_thread_synopsis(thread_id, synopsis).await {
+        warn!("state db persist_thread_synopsis failed during {stage}: {err}");
+    }
+}
+
+pub async fn persist_thread_sparse_context(
+    context: Option<&codex_state::StateRuntime>,
+    thread_id: ThreadId,
+    payload: &str,
+    stage: &str,
+) {
+    let Some(ctx) = context else {
+        return;
+    };
+    if let Err(err) = ctx.upsert_thread_sparse_context(thread_id, payload).await {
+        warn!("state db persist_thread_sparse_context failed during {stage}: {err}");
     }
 }
 

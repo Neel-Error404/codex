@@ -4,7 +4,8 @@
 
 ## Feature gate
 
-`js_repl` is disabled by default and only appears when:
+`js_repl` is disabled by default and can be enabled either from
+`/experimental` or in config:
 
 ```toml
 [features]
@@ -20,6 +21,49 @@ js_repl_tools_only = true
 ```
 
 When enabled, direct model tool calls are restricted to `js_repl` and `js_repl_reset`; other tools remain available via `await codex.tool(...)` inside js_repl.
+
+## Sparse Context And Recursive Inspection
+
+`js_repl` is also the execution substrate for the current sparse-context /
+RLM-style recursive inspection workflow.
+
+Enable it from `/experimental` or with:
+
+```toml
+[features]
+js_repl = true
+sparse_context = true
+```
+
+When `sparse_context` is enabled:
+
+- Codex injects developer instructions that bias the model toward inspect-on-demand behavior.
+- The model is steered to prefer `js_repl`, `tool_search`, `list_dir`,
+  `grep_files`, and `read_file` over eager whole-repo reads.
+- `js_repl` becomes a persistent scratchpad for targeted exploration and
+  incremental state accumulation across calls.
+
+The scratchpad is pre-seeded with these top-level bindings:
+
+- `thread_synopsis`: the latest structured carry-forward summary from compaction
+- `facts`: the mutable working synopsis for the current investigation
+- `file_summaries`: bounded per-path notes accumulated during targeted reads
+- `open_questions`: unresolved items the model still needs to verify
+
+Host/runtime behavior:
+
+- sparse-context state syncs from the kernel back to the host after each exec
+- the host persists the latest synopsis and the full sparse-context payload into
+  the SQLite state DB
+- later turns and post-reset kernels can be re-seeded from persisted sparse
+  state instead of starting empty
+- persisted state is normalized and bounded so file-summary growth does not
+  silently explode prompt carry-over
+
+This is a real recursive-inspection scaffold, but not a full reproduction of
+the research RLM stack. The current system relies on host instructions, the
+persistent REPL, targeted tool use, and persisted sparse state rather than a
+separately trained recursive controller.
 
 ## Node runtime
 

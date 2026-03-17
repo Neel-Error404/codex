@@ -1,5 +1,6 @@
 use crate::client_common::tools::ResponsesApiNamespace;
 use crate::client_common::tools::ResponsesApiNamespaceTool;
+use crate::client_common::tools::ResponsesApiTool;
 use crate::client_common::tools::ToolSearchOutputTool;
 use crate::function_tool::FunctionCallError;
 use crate::mcp_connection_manager::ToolInfo;
@@ -8,26 +9,45 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::ToolSearchOutput;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+use crate::tools::spec::dynamic_tool_to_openai_tool;
 use crate::tools::spec::mcp_tool_to_deferred_openai_tool;
 use async_trait::async_trait;
 use bm25::Document;
 use bm25::Language;
 use bm25::SearchEngineBuilder;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
-
-#[cfg(test)]
-use crate::client_common::tools::ResponsesApiTool;
 
 pub struct ToolSearchHandler {
-    tools: HashMap<String, ToolInfo>,
+    tools: Vec<SearchableTool>,
 }
 
 pub(crate) const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
 pub(crate) const DEFAULT_LIMIT: usize = 8;
 
+#[derive(Clone)]
+enum SearchableTool {
+    App { name: String, info: ToolInfo },
+    Dynamic(DynamicToolSpec),
+}
+
 impl ToolSearchHandler {
-    pub fn new(tools: HashMap<String, ToolInfo>) -> Self {
+    pub fn new(
+        app_tools: Option<std::collections::HashMap<String, ToolInfo>>,
+        dynamic_tools: &[DynamicToolSpec],
+    ) -> Self {
+        let mut tools = app_tools
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, info)| SearchableTool::App { name, info })
+            .collect::<Vec<_>>();
+        tools.extend(
+            dynamic_tools
+                .iter()
+                .filter(|tool| tool.defer_loading)
+                .cloned()
+                .map(SearchableTool::Dynamic),
+        );
         Self { tools }
     }
 }
@@ -69,8 +89,8 @@ impl ToolHandler for ToolSearchHandler {
             ));
         }
 
-        let mut entries: Vec<(String, ToolInfo)> = self.tools.clone().into_iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut entries = self.tools.clone();
+        entries.sort_by_key(searchable_tool_sort_key);
 
         if entries.is_empty() {
             return Ok(ToolSearchOutput { tools: Vec::new() });
@@ -79,7 +99,7 @@ impl ToolHandler for ToolSearchHandler {
         let documents: Vec<Document<usize>> = entries
             .iter()
             .enumerate()
-            .map(|(idx, (name, info))| Document::new(idx, build_search_text(name, info)))
+            .map(|(idx, tool)| Document::new(idx, build_search_text(tool)))
             .collect();
         let search_engine =
             SearchEngineBuilder::<usize>::with_documents(Language::English, documents).build();
@@ -87,7 +107,7 @@ impl ToolHandler for ToolSearchHandler {
 
         let matched_entries = results
             .into_iter()
-            .filter_map(|result| entries.get(result.document.id))
+            .filter_map(|result| entries.get(result.document.id).cloned())
             .collect::<Vec<_>>();
         let tools = serialize_tool_search_output_tools(&matched_entries).map_err(|err| {
             FunctionCallError::Fatal(format!("failed to encode tool_search output: {err}"))
@@ -98,20 +118,24 @@ impl ToolHandler for ToolSearchHandler {
 }
 
 fn serialize_tool_search_output_tools(
-    matched_entries: &[&(String, ToolInfo)],
+    matched_entries: &[SearchableTool],
 ) -> Result<Vec<ToolSearchOutputTool>, serde_json::Error> {
-    let grouped: BTreeMap<String, Vec<ToolInfo>> =
-        matched_entries
-            .iter()
-            .fold(BTreeMap::new(), |mut acc, (_name, tool)| {
-                acc.entry(tool.tool_namespace.clone())
+    let mut grouped = BTreeMap::<String, Vec<ToolInfo>>::new();
+    let mut dynamic_tools = Vec::<ResponsesApiTool>::new();
+
+    for entry in matched_entries {
+        match entry {
+            SearchableTool::App { info, .. } => {
+                grouped
+                    .entry(info.tool_namespace.clone())
                     .or_default()
-                    .push(tool.clone());
+                    .push(info.clone());
+            }
+            SearchableTool::Dynamic(tool) => dynamic_tools.push(dynamic_tool_to_openai_tool(tool)?),
+        }
+    }
 
-                acc
-            });
-
-    let mut results = Vec::with_capacity(grouped.len());
+    let mut results = Vec::with_capacity(grouped.len() + dynamic_tools.len());
     for (namespace, tools) in grouped {
         let Some(first_tool) = tools.first() else {
             continue;
@@ -141,10 +165,30 @@ fn serialize_tool_search_output_tools(
         }));
     }
 
+    results.extend(
+        dynamic_tools
+            .into_iter()
+            .map(ToolSearchOutputTool::Function),
+    );
+
     Ok(results)
 }
 
-fn build_search_text(name: &str, info: &ToolInfo) -> String {
+fn searchable_tool_sort_key(tool: &SearchableTool) -> String {
+    match tool {
+        SearchableTool::App { name, .. } => name.clone(),
+        SearchableTool::Dynamic(tool) => tool.name.clone(),
+    }
+}
+
+fn build_search_text(tool: &SearchableTool) -> String {
+    match tool {
+        SearchableTool::App { name, info } => build_app_search_text(name, info),
+        SearchableTool::Dynamic(tool) => build_dynamic_search_text(tool),
+    }
+}
+
+fn build_app_search_text(name: &str, info: &ToolInfo) -> String {
     let mut parts = vec![
         name.to_string(),
         info.tool_name.clone(),
@@ -178,6 +222,20 @@ fn build_search_text(name: &str, info: &ToolInfo) -> String {
     parts.extend(
         info.tool
             .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .map(|map| map.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+
+    parts.join(" ")
+}
+
+fn build_dynamic_search_text(tool: &DynamicToolSpec) -> String {
+    let mut parts = vec![tool.name.clone(), tool.description.clone()];
+
+    parts.extend(
+        tool.input_schema
             .get("properties")
             .and_then(serde_json::Value::as_object)
             .map(|map| map.keys().cloned().collect::<Vec<_>>())

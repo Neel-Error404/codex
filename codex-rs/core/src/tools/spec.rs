@@ -382,6 +382,13 @@ impl ToolsConfig {
                 SessionSource::SubAgent(SubAgentSource::Other(label))
                     if label.starts_with("agent_job:")
             );
+        let sparse_recursive_mode = include_js_repl && features.enabled(Feature::SparseContext);
+        let mut experimental_supported_tools = model_info.experimental_supported_tools.clone();
+        if sparse_recursive_mode {
+            ensure_supported_tool(&mut experimental_supported_tools, "grep_files");
+            ensure_supported_tool(&mut experimental_supported_tools, "read_file");
+            ensure_supported_tool(&mut experimental_supported_tools, "list_dir");
+        }
 
         Self {
             available_models: available_models_ref.to_vec(),
@@ -402,13 +409,13 @@ impl ToolsConfig {
             code_mode_enabled: include_code_mode,
             code_mode_only_enabled: include_code_mode_only,
             js_repl_enabled: include_js_repl,
-            js_repl_tools_only: include_js_repl_tools_only,
+            js_repl_tools_only: include_js_repl_tools_only || sparse_recursive_mode,
             can_request_original_image_detail: include_original_image_detail,
             collab_tools: include_collab_tools,
             artifact_tools: include_artifact_tools,
             request_user_input: include_request_user_input,
             default_mode_request_user_input: include_default_mode_request_user_input,
-            experimental_supported_tools: model_info.experimental_supported_tools.clone(),
+            experimental_supported_tools,
             agent_jobs_tools: include_agent_jobs,
             agent_jobs_worker_tools,
         }
@@ -457,6 +464,12 @@ impl ToolsConfig {
         nested.code_mode_enabled = false;
         nested.code_mode_only_enabled = false;
         nested
+    }
+}
+
+fn ensure_supported_tool(tools: &mut Vec<String>, name: &str) {
+    if !tools.iter().any(|tool| tool == name) {
+        tools.push(name.to_string());
     }
 }
 
@@ -1657,7 +1670,10 @@ fn create_grep_files_tool() -> ToolSpec {
     })
 }
 
-fn create_tool_search_tool(app_tools: &HashMap<String, ToolInfo>) -> ToolSpec {
+fn create_tool_search_tool(
+    app_tools: Option<&HashMap<String, ToolInfo>>,
+    dynamic_tools: &[DynamicToolSpec],
+) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "query".to_string(),
@@ -1675,7 +1691,7 @@ fn create_tool_search_tool(app_tools: &HashMap<String, ToolInfo>) -> ToolSpec {
         ),
     ]);
     let mut app_descriptions = BTreeMap::new();
-    for tool in app_tools.values() {
+    for tool in app_tools.into_iter().flat_map(|tools| tools.values()) {
         if tool.server_name != CODEX_APPS_MCP_SERVER_NAME {
             continue;
         }
@@ -1725,6 +1741,19 @@ fn create_tool_search_tool(app_tools: &HashMap<String, ToolInfo>) -> ToolSpec {
 
     let description =
         TOOL_SEARCH_DESCRIPTION_TEMPLATE.replace("{{app_descriptions}}", app_descriptions.as_str());
+    let deferred_dynamic_tool_descriptions = dynamic_tools
+        .iter()
+        .filter(|tool| tool.defer_loading)
+        .map(|tool| format!("- {}: {}", tool.name, tool.description))
+        .collect::<Vec<_>>();
+    let description = if deferred_dynamic_tool_descriptions.is_empty() {
+        description
+    } else {
+        format!(
+            "{description}\n\nYou also have access to the following deferred dynamic tools:\n{}",
+            deferred_dynamic_tool_descriptions.join("\n")
+        )
+    };
 
     ToolSpec::ToolSearch {
         execution: "client".to_string(),
@@ -2039,7 +2068,7 @@ JS_SOURCE: /(?:\s*)(?:[^\s{\"`]|`[^`]|``[^`])[\s\S]*/
 
     ToolSpec::Freeform(FreeformTool {
         name: "js_repl".to_string(),
-        description: "Runs JavaScript in a persistent Node kernel with top-level await. This is a freeform tool: send raw JavaScript source text, optionally with a first-line pragma like `// codex-js-repl: timeout_ms=15000`; do not send JSON/quotes/markdown fences."
+        description: "Runs JavaScript in a persistent Node kernel with top-level await. Use it as a scratchpad for recursive inspection: keep reusable findings in top-level variables and call other tools with `await codex.tool(name, args)` instead of loading large context upfront. This is a freeform tool: send raw JavaScript source text, optionally with a first-line pragma like `// codex-js-repl: timeout_ms=15000`; do not send JSON/quotes/markdown fences."
             .to_string(),
         format: FreeformToolFormat {
             r#type: "grammar".to_string(),
@@ -2364,7 +2393,7 @@ pub(crate) fn mcp_tool_to_deferred_openai_tool(
     })
 }
 
-fn dynamic_tool_to_openai_tool(
+pub(crate) fn dynamic_tool_to_openai_tool(
     tool: &DynamicToolSpec,
 ) -> Result<ResponsesApiTool, serde_json::Error> {
     let input_schema = parse_tool_input_schema(&tool.input_schema)?;
@@ -2373,7 +2402,7 @@ fn dynamic_tool_to_openai_tool(
         name: tool.name.clone(),
         description: tool.description.clone(),
         strict: false,
-        defer_loading: None,
+        defer_loading: tool.defer_loading.then_some(true),
         parameters: input_schema,
         output_schema: None,
     })
@@ -2798,23 +2827,26 @@ pub(crate) fn build_specs_with_discoverable_tools(
         builder.register_handler("request_permissions", request_permissions_handler);
     }
 
-    if config.search_tool
-        && let Some(app_tools) = app_tools
-    {
-        let search_tool_handler = Arc::new(ToolSearchHandler::new(app_tools.clone()));
+    let has_tool_search_apps = app_tools.is_some();
+    let has_deferred_dynamic_tools = dynamic_tools.iter().any(|tool| tool.defer_loading);
+    if config.search_tool && (has_tool_search_apps || has_deferred_dynamic_tools) {
+        let search_tool_handler =
+            Arc::new(ToolSearchHandler::new(app_tools.clone(), dynamic_tools));
         push_tool_spec(
             &mut builder,
-            create_tool_search_tool(&app_tools),
+            create_tool_search_tool(app_tools.as_ref(), dynamic_tools),
             true,
             config.code_mode_enabled,
         );
         builder.register_handler(TOOL_SEARCH_TOOL_NAME, search_tool_handler);
 
-        for tool in app_tools.values() {
-            let alias_name =
-                tool_handler_key(tool.tool_name.as_str(), Some(tool.tool_namespace.as_str()));
+        if let Some(app_tools) = app_tools.as_ref() {
+            for tool in app_tools.values() {
+                let alias_name =
+                    tool_handler_key(tool.tool_name.as_str(), Some(tool.tool_namespace.as_str()));
 
-            builder.register_handler(alias_name, mcp_handler.clone());
+                builder.register_handler(alias_name, mcp_handler.clone());
+            }
         }
     }
 

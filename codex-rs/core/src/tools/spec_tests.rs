@@ -50,6 +50,22 @@ fn discoverable_connector(id: &str, name: &str, description: &str) -> Discoverab
     }))
 }
 
+fn dynamic_tool(name: &str, description: &str, defer_loading: bool) -> DynamicToolSpec {
+    DynamicToolSpec {
+        name: name.to_string(),
+        description: description.to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "city": { "type": "string" }
+            },
+            "required": ["city"],
+            "additionalProperties": false
+        }),
+        defer_loading,
+    }
+}
+
 fn search_capable_model_info() -> ModelInfo {
     let config = test_config();
     let mut model_info =
@@ -841,6 +857,79 @@ fn js_repl_enabled_adds_tools() {
     });
     let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
     assert_contains_tool_names(&tools, &["js_repl", "js_repl_reset"]);
+}
+
+#[test]
+fn sparse_context_enables_recursive_js_repl_mode() {
+    let config = test_config();
+    let model_info = ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+    let mut features = Features::with_defaults();
+    features.enable(Feature::JsRepl);
+    features.enable(Feature::SparseContext);
+
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+
+    assert!(tools_config.js_repl_enabled);
+    assert!(
+        tools_config.js_repl_tools_only,
+        "sparse_context should force js_repl orchestration"
+    );
+    assert!(
+        tools_config
+            .experimental_supported_tools
+            .contains(&"grep_files".to_string())
+    );
+    assert!(
+        tools_config
+            .experimental_supported_tools
+            .contains(&"read_file".to_string())
+    );
+    assert!(
+        tools_config
+            .experimental_supported_tools
+            .contains(&"list_dir".to_string())
+    );
+}
+
+#[test]
+fn sparse_context_builds_recursive_inspection_tools() {
+    let config = test_config();
+    let model_info = ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+    let mut features = Features::with_defaults();
+    features.enable(Feature::JsRepl);
+    features.enable(Feature::SparseContext);
+
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+
+    assert_contains_tool_names(
+        &tools,
+        &[
+            "js_repl",
+            "js_repl_reset",
+            "grep_files",
+            "read_file",
+            "list_dir",
+        ],
+    );
 }
 
 #[test]
@@ -1969,6 +2058,69 @@ fn search_tool_description_falls_back_to_connector_name_without_description() {
 
     assert!(description.contains("- Calendar"));
     assert!(!description.contains("- Calendar:"));
+}
+
+#[test]
+fn search_tool_is_registered_for_deferred_dynamic_tools_without_apps() {
+    let model_info = search_capable_model_info();
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &Features::with_defaults(),
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+
+    let (tools, _) = build_specs(
+        &tools_config,
+        None,
+        None,
+        &[dynamic_tool(
+            "hidden_dynamic_tool",
+            "A hidden dynamic tool.",
+            true,
+        )],
+    )
+    .build();
+
+    assert_contains_tool_names(&tools, &[TOOL_SEARCH_TOOL_NAME]);
+}
+
+#[test]
+fn search_tool_description_lists_deferred_dynamic_tools() {
+    let model_info = search_capable_model_info();
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &Features::with_defaults(),
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+
+    let (tools, _) = build_specs(
+        &tools_config,
+        None,
+        None,
+        &[dynamic_tool(
+            "hidden_dynamic_tool",
+            "A hidden dynamic tool.",
+            true,
+        )],
+    )
+    .build();
+    let search_tool = find_tool(&tools, TOOL_SEARCH_TOOL_NAME);
+    let ToolSpec::ToolSearch { description, .. } = &search_tool.spec else {
+        panic!("expected tool_search tool");
+    };
+
+    assert!(description.contains("hidden_dynamic_tool"));
+    assert!(description.contains("A hidden dynamic tool."));
 }
 
 #[test]

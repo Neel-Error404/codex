@@ -17,6 +17,7 @@ You can also install via Homebrew (`brew install --cask codex`) or download a pl
 
 - First run with Codex? Start with [`docs/getting-started.md`](../docs/getting-started.md) (links to the walkthrough for prompts, keyboard shortcuts, and session management).
 - Want deeper control? See [`docs/config.md`](../docs/config.md) and [`docs/install.md`](../docs/install.md).
+- Tracking the long-thread/tool-heavy runtime work in this branch? See [`docs/plans/2026-03-17-gpt54-agent-upgrades.md`](../docs/plans/2026-03-17-gpt54-agent-upgrades.md).
 
 ## What's new in the Rust CLI
 
@@ -25,6 +26,17 @@ The Rust implementation is now the maintained Codex CLI and serves as the defaul
 ### Config
 
 Codex supports a rich set of configuration options. Note that the Rust CLI uses `config.toml` instead of `config.json`. See [`docs/config.md`](../docs/config.md) for details.
+
+### Long-thread agent upgrades in this branch
+
+This branch adds three connected pieces of runtime behavior:
+
+- structured thread synopsis persistence derived from compaction
+- deferred tool discovery with `tool_search`
+- sparse-context / RLM-style recursive inspection built on `js_repl`
+
+The implementation status, scope, and remaining gaps are documented in
+[`docs/plans/2026-03-17-gpt54-agent-upgrades.md`](../docs/plans/2026-03-17-gpt54-agent-upgrades.md).
 
 ### Model Context Protocol Support
 
